@@ -22,11 +22,6 @@ async function runBrandPhase(logger) {
   return run({ batchSize: 99999 })
 }
 
-async function runValidatePhase(logger) {
-  const { run } = await import('./validate.js')
-  return run({ batchSize: 99999 })
-}
-
 async function runEnrichPhase(logger) {
   const { run } = await import('./enrichment.js')
   return run({ batchSize: 99999 })
@@ -47,6 +42,8 @@ async function exhaustPhase(phaseName, runFn, logger) {
   let totalProcessed = 0
   let totalResolved = 0
   let round = 0
+  let prevRoundProcessed = -1
+  let prevRoundResolved = -1
 
   while (true) {
     round++
@@ -76,6 +73,15 @@ async function exhaustPhase(phaseName, runFn, logger) {
       console.log(`[Backlog] ${phaseName} — no progress (${processed} processed, 0 resolved), moving on`)
       break
     }
+
+    // 3. Same result twice in a row — loop detected (e.g. validate cost-resets that don't advance)
+    if (processed === prevRoundProcessed && resolved === prevRoundResolved) {
+      console.log(`[Backlog] ${phaseName} — identical result two rounds in a row (${processed} processed, ${resolved} resolved), loop detected, moving on`)
+      break
+    }
+
+    prevRoundProcessed = processed
+    prevRoundResolved = resolved
   }
 
   console.log(`[Backlog] ${phaseName} complete — total processed: ${totalProcessed}, total resolved: ${totalResolved}`)
@@ -109,10 +115,7 @@ async function run() {
     // Phase 2: Brand
     summary.brand = await exhaustPhase('brand', runBrandPhase, logger)
 
-    // Phase 3: Validate
-    summary.validate = await exhaustPhase('validate', runValidatePhase, logger)
-
-    // Phase 4: Enrich
+    // Phase 3: Enrich
     summary.enrich = await exhaustPhase('enrich', runEnrichPhase, logger)
 
     // Phase 5: Report — always runs once as final snapshot

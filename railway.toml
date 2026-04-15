@@ -27,14 +27,6 @@ cronSchedule = "6,26,46 * * * *"
 restartPolicyType = "never"
 
 [[services]]
-name = "worker-validate"
-startCommand = "npm run validate"
-
-[services.deploy]
-cronSchedule = "10,30,50 * * * *"
-restartPolicyType = "never"
-
-[[services]]
 name = "worker-report"
 startCommand = "npm run report"
 

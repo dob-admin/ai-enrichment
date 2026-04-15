@@ -13,7 +13,7 @@ export async function enrichRecord(record, sources) {
   try {
     const response = await withRetry(
       () => client.messages.create({
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-sonnet-4-6',
         max_tokens: 2000,
         messages: [{ role: 'user', content: userMessage }],
         system: systemPrompt,
@@ -48,7 +48,7 @@ export async function enrichRecord(record, sources) {
 export async function classifyBrand(brandName) {
   const response = await withRetry(
     () => client.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-6',
       max_tokens: 100,
       messages: [{
         role: 'user',
