@@ -116,20 +116,20 @@ async function run() {
     console.log(`\n[Cost Lookup] ${itemNumber} — searching...`)
 
     const brand = f[FIELDS.BRAND_CORRECT_SPELL] || f[FIELDS.BRAND] || ''
-    const foundCost = await findCostViaChain(f, brand, brandSet, brandKeys)
+    const found = await findCostViaChain(f, brand, brandSet, brandKeys)
 
-    if (foundCost && foundCost > 0.01) {
+    if (found && found.cost > 0.01) {
       await writeField(record.id, {
-        [FIELDS.ITEM_COST]: foundCost,
+        [FIELDS.ITEM_COST]: found.cost,
         [FIELDS.AI_COST_CHECK]: AI_COST_CHECK.FOUND,
       })
-      console.log(`  ✓ Found cost: $${foundCost}`)
-      logger.log({ itemNumber, website: f[FIELDS.WEBSITE], brand: f[FIELDS.BRAND_CORRECT_SPELL] || f[FIELDS.BRAND], outcome: 'Found', costFound: foundCost })
+      console.log(`  ✓ Found cost: $${found.cost}`)
+      logger.log({ itemNumber, website: f[FIELDS.WEBSITE], brand: f[FIELDS.BRAND_CORRECT_SPELL] || f[FIELDS.BRAND], outcome: 'Found', costFound: found.cost, costSource: found.source, modelCandidates: found.modelCandidates })
       results.found++
     } else {
       await writeField(record.id, { [FIELDS.AI_COST_CHECK]: AI_COST_CHECK.MISSING })
       console.log(`  ✗ Could not find cost`)
-      logger.log({ itemNumber, website: f[FIELDS.WEBSITE], brand: f[FIELDS.BRAND_CORRECT_SPELL] || f[FIELDS.BRAND], outcome: 'Missing' })
+      logger.log({ itemNumber, website: f[FIELDS.WEBSITE], brand: f[FIELDS.BRAND_CORRECT_SPELL] || f[FIELDS.BRAND], outcome: 'Missing', modelCandidates: [] })
       results.missing++
     }
   }
@@ -177,7 +177,7 @@ async function findCostViaChain(fields, brand, brandSet, brandKeys) {
         (sibKey.length > 3 && brandKey.includes(sibKey))
       if (matchCost > 0.01 && brandMatch) {
         console.log(`  → UPC item number match cost: $${matchCost} (${matchItemNum})`)
-        return matchCost
+        return { cost: matchCost, source: matchItemNum, modelCandidates: [] }
       }
       // Extract model candidates from its item number
       extractModelCandidates(matchItemNum, brand, brandSet, brandKeys)
@@ -237,7 +237,7 @@ async function findCostViaChain(fields, brand, brandSet, brandKeys) {
         if (costs.length) {
           const cost = costs[Math.floor(costs.length / 2)] // median
           console.log(`  → Model "${model}" brand-matched siblings: [${costs.map(c => '$'+c).join(', ')}] → median $${cost}`)
-          return cost
+          return { cost, source: siblings.map(r => r.fields[FIELDS.ITEM_NUMBER]).join(', '), modelCandidates: [...modelCandidates] }
         }
       } else if (siblings.length) {
         console.log(`  - Model "${model}" found siblings but brand mismatch — skipping`)
@@ -253,7 +253,7 @@ async function findCostViaChain(fields, brand, brandSet, brandKeys) {
     const gfCost = goflow?.raw?.pricing?.default_cost || null
     if (gfCost > 0.01) {
       console.log(`  → GoFlow cost: $${gfCost}`)
-      return gfCost
+      return { cost: gfCost, source: 'GoFlow', modelCandidates: [] }
     }
   } catch {}
 
