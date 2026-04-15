@@ -18,8 +18,8 @@ import { FIELDS, WEBSITE, FOOTWEAR_STORES, AI_STATUS } from '../config/fields.js
 
 const BATCH_SIZE = parseInt(process.env.ENRICH_BATCH_SIZE || '20')
 
-async function run({ batchSize } = {}) {
-  await exitIfLocked('Enrichment')
+async function run({ batchSize, skipLockCheck } = {}) {
+  if (!skipLockCheck) await exitIfLocked('Enrichment')
   console.log(`[Enrichment] Starting run at ${new Date().toISOString()}`)
   const logger = new WorkerLogger('enrich')
 

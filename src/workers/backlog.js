@@ -1,7 +1,7 @@
 // src/workers/backlog.js
 // One-shot backlog processor — runs all phases sequentially until exhausted
 // Triggered manually via Railway deploy (no cron). Exits when done.
-// Phase order: Cost → Brand → Validate → Enrich → Report
+// Phase order: Cost → Brand → Enrich → Validate → Report
 // Progress detection prevents infinite loops on stuck records
 
 import 'dotenv/config'
@@ -14,17 +14,22 @@ import { acquireLock, releaseLock } from '../lib/lock.js'
 
 async function runCostPhase(logger) {
   const { run } = await import('./costLookup.js')
-  return run({ batchSize: 99999 })
+  return run({ batchSize: 99999, skipLockCheck: true })
 }
 
 async function runBrandPhase(logger) {
   const { run } = await import('./brandResolution.js')
-  return run({ batchSize: 99999 })
+  return run({ batchSize: 99999, skipLockCheck: true })
 }
 
 async function runEnrichPhase(logger) {
   const { run } = await import('./enrichment.js')
-  return run({ batchSize: 99999 })
+  return run({ batchSize: 99999, skipLockCheck: true })
+}
+
+async function runValidatePhase(logger) {
+  const { run } = await import('./validate.js')
+  return run({ batchSize: 99999, skipLockCheck: true })
 }
 
 async function runReportPhase() {
@@ -117,6 +122,9 @@ async function run() {
 
     // Phase 3: Enrich
     summary.enrich = await exhaustPhase('enrich', runEnrichPhase, logger)
+
+    // Phase 4: Validate — auto-fix PD Hold records still invalid after enrich
+    summary.validate = await exhaustPhase('validate', runValidatePhase, logger)
 
     // Phase 5: Report — always runs once as final snapshot
     console.log(`\n${'═'.repeat(50)}`)

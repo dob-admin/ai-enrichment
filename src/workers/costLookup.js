@@ -64,8 +64,8 @@ async function loadBrandSet() {
   return { brandSet, brandKeys }
 }
 
-async function run({ batchSize } = {}) {
-  await exitIfLocked('Cost Lookup')
+async function run({ batchSize, skipLockCheck } = {}) {
+  if (!skipLockCheck) await exitIfLocked('Cost Lookup')
   console.log(`[Cost Lookup] Starting run at ${new Date().toISOString()}`)
   const logger = new WorkerLogger('cost')
 

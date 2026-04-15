@@ -14,8 +14,8 @@ const table = () => base(process.env.AIRTABLE_TABLE_ID)
 const delay = (ms) => new Promise(r => setTimeout(r, ms))
 const RATE_DELAY = parseInt(process.env.AIRTABLE_RATE_DELAY_MS || '250')
 
-async function run({ batchSize } = {}) {
-  await exitIfLocked('Validate')
+async function run({ batchSize, skipLockCheck } = {}) {
+  if (!skipLockCheck) await exitIfLocked('Validate')
   console.log(`[Validate] Starting run at ${new Date().toISOString()}`)
   const logger = new WorkerLogger('validate')
 
@@ -58,7 +58,7 @@ async function run({ batchSize } = {}) {
 
   console.log(`[Validate] Found ${records.length} invalid PD Hold records`)
 
-  const results = { fixed: 0, partial: 0, flagged: 0 }
+  const results = { fixed: 0, partial: 0, flagged: 0, costReset: 0, reEnqueued: 0 }
 
   for (const record of records) {
     const f = record.fields
@@ -73,6 +73,7 @@ async function run({ batchSize } = {}) {
 
     const fixes = {}
     const unfixable = []
+    const needsReEnrich = []
 
     // ── PRODUCT INFO FIXES ───────────────────────────────────────────────
 
@@ -82,7 +83,7 @@ async function run({ batchSize } = {}) {
         fixes[FIELDS.VARIANT_IMAGE_INDEX] = 1
         console.log(`  ✓ Fix: set Variant Image Index = 1`)
       } else {
-        unfixable.push('Product Images missing')
+        needsReEnrich.push('Product Images (variant image index)')
       }
     }
 
@@ -102,34 +103,43 @@ async function run({ batchSize } = {}) {
       console.log(`  ✓ Fix: price → $${newPrice} (cost × 1.5)`)
     }
 
-    // Missing Material (SDO/Rebound only)
+    // Missing Material (SDO/Rebound only) — re-enrich, don't flag VA
     if (FOOTWEAR_STORES.includes(website) && !f[FIELDS.MATERIAL]?.length) {
-      unfixable.push('Material missing — needs manual lookup')
+      needsReEnrich.push('Material')
     }
 
-    // Missing Option 1 Value (SDO/Rebound only)
+    // Missing Option 1 Value (SDO/Rebound only) — re-enrich, don't flag VA
     if (FOOTWEAR_STORES.includes(website) && !f[FIELDS.OPTION_1_VALUE]) {
-      unfixable.push('Option 1 Value (colorway) missing — needs manual lookup')
+      needsReEnrich.push('Option 1 Value (colorway)')
     }
 
-    // Missing Title
+    // Missing Title — re-enrich
     if (!f[FIELDS.TITLE]) {
-      unfixable.push('Title missing — needs enrichment or manual entry')
+      needsReEnrich.push('Title')
     }
 
-    // Missing Description
+    // Missing Description — re-enrich
     if (!f[FIELDS.DESCRIPTION]) {
-      unfixable.push('Description missing — needs enrichment or manual entry')
+      needsReEnrich.push('Description')
     }
 
-    // Missing Product Images
+    // Missing Product Images — re-enrich
     if (!f[FIELDS.PRODUCT_IMAGES]?.length) {
-      unfixable.push('Product Images missing — needs manual upload')
+      needsReEnrich.push('Product Images')
     }
 
-    // Missing Shopify Category
+    // Missing Shopify Category — re-enrich
     if (!f[FIELDS.SHOPIFY_CATEGORY]) {
-      unfixable.push('Shopify Category missing — needs enrichment or manual entry')
+      needsReEnrich.push('Shopify Category')
+    }
+
+    // If any content fields are missing, clear PD_READY_HOLD so enrich re-runs
+    if (needsReEnrich.length > 0) {
+      fixes[FIELDS.PD_READY_HOLD] = false
+      if (process.env.AI_STATUS_FIELD_ID) {
+        fixes[FIELDS.AI_STATUS] = null  // clear so enrich first pass picks it up
+      }
+      console.log(`  ↩ Re-enqueue: clearing PD Ready Hold + AI Status for missing: ${needsReEnrich.join(', ')}`)
     }
 
     // ── WRITE FIXES ──────────────────────────────────────────────────────
@@ -139,18 +149,34 @@ async function run({ batchSize } = {}) {
         fixes[FIELDS.AI_MISSING] = unfixable.join(', ')
       }
 
+      // A cost-only reset is NOT a resolution — the record is still invalid,
+      // it's just queued for the cost worker to retry. Don't count as fixed.
+      const onlyCostReset = Object.keys(fixes).every(
+        k => k === FIELDS.AI_COST_CHECK || k === FIELDS.AI_MISSING
+      )
+
+      // Re-enqueue: PD_READY_HOLD cleared so enrich picks it up again
+      const isReEnqueue = fixes[FIELDS.PD_READY_HOLD] === false
+
       try {
         await delay(RATE_DELAY)
-        // Pass null values explicitly to clear fields (e.g. AI_COST_CHECK reset)
         await table().update(record.id, fixes)
         console.log(`  → Applied ${Object.keys(fixes).length} fix(es)`)
-        logger.log({ itemNumber, website: f[FIELDS.WEBSITE], outcome: unfixable.length === 0 ? 'Fixed' : 'Partial', fieldsWritten: Object.keys(fixes), missingFields: unfixable })
 
-        if (unfixable.length === 0) {
+        if (isReEnqueue) {
+          results.reEnqueued++
+          logger.log({ itemNumber, website: f[FIELDS.WEBSITE], outcome: 'ReEnqueued', fieldsWritten: Object.keys(fixes), missingFields: needsReEnrich })
+        } else if (onlyCostReset) {
+          results.costReset++
+          console.log(`  ⏳ Cost reset queued — needs cost worker re-run`)
+          logger.log({ itemNumber, website: f[FIELDS.WEBSITE], outcome: 'CostReset', fieldsWritten: Object.keys(fixes), missingFields: unfixable })
+        } else if (unfixable.length === 0) {
           results.fixed++
+          logger.log({ itemNumber, website: f[FIELDS.WEBSITE], outcome: 'Fixed', fieldsWritten: Object.keys(fixes), missingFields: unfixable })
         } else {
           results.partial++
           console.log(`  ⚠ Still needs: ${unfixable.join('; ')}`)
+          logger.log({ itemNumber, website: f[FIELDS.WEBSITE], outcome: 'Partial', fieldsWritten: Object.keys(fixes), missingFields: unfixable })
         }
       } catch (err) {
         console.error(`  ERROR writing fixes: ${err.message}`)
@@ -172,8 +198,9 @@ async function run({ batchSize } = {}) {
   }
 
   await logger.finish(results)
-  console.log(`\n[Validate] Done — Fixed: ${results.fixed}, Partially fixed: ${results.partial}, Flagged for manual: ${results.flagged}`)
-  return { processed: results.fixed + results.partial + results.flagged, resolved: results.fixed + results.partial }
+  console.log(`\n[Validate] Done — Fixed: ${results.fixed}, Partially fixed: ${results.partial}, Re-enqueued: ${results.reEnqueued}, Cost Reset: ${results.costReset}, Flagged for manual: ${results.flagged}`)
+  // reEnqueued and costReset are NOT resolved — they need enrich/cost to re-run
+  return { processed: results.fixed + results.partial + results.flagged + results.costReset + results.reEnqueued, resolved: results.fixed + results.partial }
 }
 
 export { run }
