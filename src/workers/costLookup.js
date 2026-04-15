@@ -2,6 +2,7 @@
 // Worker 5: Cost Lookup — finds missing costs via UPC chain + model sibling matching
 import 'dotenv/config'
 import { fileURLToPath } from 'url'
+import { exitIfLocked } from '../lib/lock.js'
 import Airtable from 'airtable'
 import {
   FIELDS,
@@ -64,6 +65,7 @@ async function loadBrandSet() {
 }
 
 async function run() {
+  await exitIfLocked('Cost Lookup')
   console.log(`[Cost Lookup] Starting run at ${new Date().toISOString()}`)
   const logger = new WorkerLogger('cost')
 

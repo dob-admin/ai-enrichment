@@ -2,6 +2,7 @@
 // Worker 3: Hourly status summary
 import 'dotenv/config'
 import { fileURLToPath } from 'url'
+import { exitIfLocked } from '../lib/lock.js'
 import { getStatusCounts } from '../lib/airtable.js'
 import { WorkerLogger } from '../lib/logger.js'
 

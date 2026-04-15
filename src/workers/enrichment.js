@@ -2,6 +2,7 @@
 // Worker 2: AI enrichment pipeline — the main worker
 import 'dotenv/config'
 import { fileURLToPath } from 'url'
+import { exitIfLocked } from '../lib/lock.js'
 import {
   getEnrichmentQueue,
   findMatchesByModel,
@@ -18,6 +19,7 @@ import { FIELDS, WEBSITE, FOOTWEAR_STORES, AI_STATUS } from '../config/fields.js
 const BATCH_SIZE = parseInt(process.env.ENRICH_BATCH_SIZE || '20')
 
 async function run() {
+  await exitIfLocked('Enrichment')
   console.log(`[Enrichment] Starting run at ${new Date().toISOString()}`)
   const logger = new WorkerLogger('enrich')
 

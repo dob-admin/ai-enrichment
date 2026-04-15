@@ -3,6 +3,7 @@
 // invalid and fixes what it can automatically, flags what it can't
 import 'dotenv/config'
 import { fileURLToPath } from 'url'
+import { exitIfLocked } from '../lib/lock.js'
 import Airtable from 'airtable'
 import { FIELDS, AI_STATUS, WEBSITE, FOOTWEAR_STORES, AI_COST_CHECK } from '../config/fields.js'
 import { WorkerLogger } from '../lib/logger.js'
@@ -14,6 +15,7 @@ const delay = (ms) => new Promise(r => setTimeout(r, ms))
 const RATE_DELAY = parseInt(process.env.AIRTABLE_RATE_DELAY_MS || '250')
 
 async function run() {
+  await exitIfLocked('Validate')
   console.log(`[Validate] Starting run at ${new Date().toISOString()}`)
   const logger = new WorkerLogger('validate')
 

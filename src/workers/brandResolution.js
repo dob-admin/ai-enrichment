@@ -2,6 +2,7 @@
 // Worker 1: Resolves missing brand fields by matching item numbers to BQ Brands
 import 'dotenv/config'
 import { fileURLToPath } from 'url'
+import { exitIfLocked } from '../lib/lock.js'
 import Fuse from 'fuse.js'
 import {
   getMissingBrandRecords,
@@ -16,6 +17,7 @@ const BATCH_SIZE = parseInt(process.env.BRAND_BATCH_SIZE || '50')
 const CONFIDENCE_THRESHOLD = 0.85 // Fuse.js score is 0–1, lower = better match
 
 async function run() {
+  await exitIfLocked('Brand Resolution')
   console.log(`[Brand Resolution] Starting run at ${new Date().toISOString()}`)
   const logger = new WorkerLogger('brand')
 

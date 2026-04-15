@@ -6,6 +6,7 @@
 
 import 'dotenv/config'
 import { WorkerLogger } from '../lib/logger.js'
+import { acquireLock, releaseLock } from '../lib/lock.js'
 
 // ─── Phase runners ────────────────────────────────────────────────────────────
 // Each phase runs one batch and returns { processed, resolved }
@@ -97,6 +98,8 @@ async function run() {
   console.log(`[Backlog] Starting full backlog run at ${new Date().toISOString()}`)
   console.log(`${'█'.repeat(50)}`)
 
+  await acquireLock()
+
   const summary = {}
 
   try {
@@ -121,6 +124,8 @@ async function run() {
   } catch (err) {
     console.error(`[Backlog] Fatal error:`, err.message)
     logger.log({ outcome: 'Error', errorMessage: err.message })
+  } finally {
+    await releaseLock()
   }
 
   const durationS = ((Date.now() - startTime) / 1000).toFixed(0)
