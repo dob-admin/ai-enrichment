@@ -90,7 +90,6 @@ export async function getEnrichmentQueue(limit = 20) {
       FIELDS.BRAND_SITE,
       FIELDS.OTHER_SITE,
       FIELDS.ITEM_COST,
-      FIELDS.ASIN,
     ],
     maxRecords: limit,
   }).eachPage((page, next) => {
