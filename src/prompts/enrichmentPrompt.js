@@ -1,7 +1,6 @@
 // src/prompts/enrichmentPrompt.js
 import {
   APPROVED_MATERIALS,
-  FOOTWEAR_SHOPIFY_CATEGORIES,
   CONDITION_LABELS,
   FOOTWEAR_STORES,
   WEBSITE,
@@ -65,31 +64,30 @@ Rules:
 - Plain text, no markdown
 - Summarizes the product effectively
 
-${isFootwear ? `## SHOPIFY CATEGORY (FOOTWEAR — choose exactly one)
-${FOOTWEAR_SHOPIFY_CATEGORIES.map(c => `- ${c}`).join('\n')}` : `## SHOPIFY CATEGORY (NPCN — use full Shopify taxonomy)
-Use the most specific applicable category from the Shopify Standard Product Taxonomy 2026-02.
-Examples: "Apparel & Accessories > Clothing > Activewear", "Electronics > Audio > Headphones", etc.
-Format: use the full path with > separators.`}
+## SHOPIFY CATEGORY
+Use the most specific applicable full path from the Shopify Standard Product Taxonomy (version 2026-02).
+Return the full path using ' > ' separators (e.g., "Apparel & Accessories > Shoes > Athletic Shoes").
+This is critical — Google Shopping category is derived automatically from this value, so accuracy matters.
+Go as deep as the taxonomy allows for this product type.
+Examples:
+- Running shoe → "Apparel & Accessories > Shoes > Athletic Shoes"
+- Hiking boot → "Apparel & Accessories > Shoes > Boots"
+- Sandal → "Apparel & Accessories > Shoes > Sandals"
+- Backpack → "Luggage & Travel > Bags > Backpacks"
+- Hydration pack → "Sporting Goods > Outdoor Recreation > Hiking & Camping > Hydration Packs"
+- Basketball → "Sporting Goods > Athletics > Team Sports > Basketball > Basketballs"
+- Water bottle → "Home & Garden > Kitchen & Dining > Drinkware > Tumblers & Water Bottles"
+- Insole → "Apparel & Accessories > Accessories > Shoe Accessories > Insoles & Inserts"
+- Children's book → "Media > Books > Children's Books"
+- Building set (Lego) → "Toys & Games > Building Toys > Building Sets"
+- Body wash → "Health & Beauty > Personal Care > Bath & Body > Body Wash & Shower Gel"
+- Bra → "Apparel & Accessories > Clothing > Underwear & Intimates > Bras"
+- Swiss Army knife → "Hardware > Tools"
+- Pizza oven accessory → "Home & Garden > Kitchen & Dining > Kitchen Appliances > Grills & Outdoor Cooking > Pizza Ovens"
 
 ## GOOGLE SHOPPING CATEGORY
-Return as a numeric string (e.g. "187" for footwear, "188" for jewelry).
-Common values:
-- Footwear (all types): 187
-- Jewelry: 188
-- Bags/Luggage: 3032
-- Wallets: 2668
-- Hats: 173
-- Gloves: 170
-- Socks: 209
-- Activewear: 5322
-- Insoles: 1933
-- Toys: 1249
-- Electronics: 222
-- Home & Garden: 536
-- Health & Beauty: 491
-- Sporting Goods: 988
-- Baby & Toddler: 537
-Use your knowledge of Google's product taxonomy for any category not listed above.
+Do NOT return a googleShoppingCategory. It is derived automatically from the Shopify Category via taxonomy lookup.
+Set "googleShoppingCategory": null in your output.
 
 ${isFootwear ? `## MATERIALS (HARD CONSTRAINT)
 ONLY use materials from this approved list:
@@ -160,16 +158,16 @@ ${sourceText || 'No sources found — return Not Found status'}
   "title": "string — model name only",
   "description": "string — full markdown description per spec",
   "seoDescription": "string — max 160 chars",
-  "shopifyCategory": "string",
-  "googleShoppingCategory": "string — numeric ID",
+  "shopifyCategory": "string — full Shopify taxonomy path (e.g. 'Apparel & Accessories > Shoes > Athletic Shoes')",
+  "googleShoppingCategory": null,
   "material": ["array", "of", "materials"] or null,
   "option1Value": "string — colorway" or null,
   "option2CustomValue": "string" or null,
   "option3CustomValue": "string — condition text for NPCN RTV" or null,
-  "price": number or null,              // retail/market price in USD if found in sources
+  "price": number or null,
   "imageUrls": ["array", "of", "url", "strings"],
   "confidence": "high" | "medium" | "low",
-  "missingFields": ["list of field names Claude could not fill"],
+  "missingFields": ["only use: Title, Description, SEO Description, Shopify Category, Material, Option 1 Value (colorway), Product Images, price, Option 3 Custom Value (used condition)"],
   "validationIssues": ["list of any sanity check concerns"],
   "sourceUsed": "description of which source was used and why"
 }`

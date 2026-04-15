@@ -11,6 +11,7 @@ import {
   CONDITION_LABELS,
   APPROVED_MATERIALS,
 } from '../config/fields.js'
+import { lookupGoogleCategory } from '../config/taxonomy.js'
 
 // Build the Airtable update payload from Claude's output
 export function buildWritePayload(claudeOutput, record) {
@@ -50,32 +51,25 @@ export function buildWritePayload(claudeOutput, record) {
     missingFields.push('SEO Description')
   }
 
-  // --- SHOPIFY CATEGORY ---
+  // --- SHOPIFY CATEGORY + GOOGLE CATEGORY ---
+  // Shopify category drives Google category via taxonomy lookup — no separate Claude call needed
   if (claudeOutput.shopifyCategory) {
     fields[FIELDS.SHOPIFY_CATEGORY] = claudeOutput.shopifyCategory
+    // Look up Google category from taxonomy
+    const googleId = lookupGoogleCategory(claudeOutput.shopifyCategory)
+    if (googleId) {
+      fields[FIELDS.GOOGLE_CATEGORY] = googleId
+    }
   } else {
     missingFields.push('Shopify Category')
   }
 
-  // --- GOOGLE SHOPPING CATEGORY ---
-  if (claudeOutput.googleShoppingCategory) {
-    fields[FIELDS.GOOGLE_CATEGORY] = claudeOutput.googleShoppingCategory
-  } else {
-    missingFields.push('Google Shopping Category')
-  }
-
   // --- MATERIAL (footwear only) ---
-  if (isFootwear) {
-    if (claudeOutput.material?.length) {
-      // Filter to only approved options that exist in Airtable
-      const filtered = claudeOutput.material.filter(m => APPROVED_MATERIALS.includes(m))
-      if (filtered.length) {
-        fields[FIELDS.MATERIAL] = filtered
-      } else {
-        missingFields.push('Material')
-      }
-    } else {
-      missingFields.push('Material')
+  // Write if Claude found it, but never block completion — material is not a required field
+  if (isFootwear && claudeOutput.material?.length) {
+    const filtered = claudeOutput.material.filter(m => APPROVED_MATERIALS.includes(m))
+    if (filtered.length) {
+      fields[FIELDS.MATERIAL] = filtered
     }
   }
 
@@ -120,15 +114,15 @@ export function buildWritePayload(claudeOutput, record) {
   }
 
   // --- PRICE ---
-  // Priority: Keepa price → GoFlow listing price → cost × 1.5
   const price = claudeOutput.price || null
   const cost = record.airtableData?.itemCost || null
   if (price && price > 0) {
     fields[FIELDS.PRICE] = price
   } else if (cost && cost > 0) {
     fields[FIELDS.PRICE] = parseFloat((cost * 1.5).toFixed(2))
+  } else {
+    missingFields.push('price')
   }
-  // If no cost either, leave blank — VA will set manually
 
   // --- MANUAL CONDITION TYPE ---
   // Set if condition code exists but was not at end of item number
