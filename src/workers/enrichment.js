@@ -38,7 +38,8 @@ async function run() {
     try {
       const result = await processRecord(record)
       results[statusKey(result.status)]++
-      console.log(`  → ${result.status} (${result.missingFields?.length || 0} missing fields)`)
+      const missingCount = result.missingFields?.length || 0
+      console.log(`  → ${result.status}${missingCount > 0 ? ` (${missingCount} optional fields missing)` : ''}`)
       if (result.validationIssues?.length) {
         console.log(`  ⚠ Validation: ${result.validationIssues.join('; ')}`)
       }
