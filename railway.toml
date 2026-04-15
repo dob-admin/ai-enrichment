@@ -1,0 +1,43 @@
+# railway.toml
+[build]
+builder = "nixpacks"
+
+[[services]]
+name = "worker-cost"
+startCommand = "npm run cost"
+
+[services.deploy]
+cronSchedule = "*/20 * * * *"
+restartPolicyType = "never"
+
+[[services]]
+name = "worker-brand"
+startCommand = "npm run brand"
+
+[services.deploy]
+cronSchedule = "3,23,43 * * * *"
+restartPolicyType = "never"
+
+[[services]]
+name = "worker-enrich"
+startCommand = "npm run enrich"
+
+[services.deploy]
+cronSchedule = "6,26,46 * * * *"
+restartPolicyType = "never"
+
+[[services]]
+name = "worker-validate"
+startCommand = "npm run validate"
+
+[services.deploy]
+cronSchedule = "10,30,50 * * * *"
+restartPolicyType = "never"
+
+[[services]]
+name = "worker-report"
+startCommand = "npm run report"
+
+[services.deploy]
+cronSchedule = "0 * * * *"
+restartPolicyType = "never"
