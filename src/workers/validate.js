@@ -4,6 +4,7 @@
 import 'dotenv/config'
 import Airtable from 'airtable'
 import { FIELDS, AI_STATUS, WEBSITE, FOOTWEAR_STORES, AI_COST_CHECK } from '../config/fields.js'
+import { WorkerLogger } from '../lib/logger.js'
 
 const base = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY })
   .base(process.env.AIRTABLE_BASE_ID)
@@ -13,6 +14,7 @@ const RATE_DELAY = parseInt(process.env.AIRTABLE_RATE_DELAY_MS || '250')
 
 async function run() {
   console.log(`[Validate] Starting run at ${new Date().toISOString()}`)
+  const logger = new WorkerLogger('validate')
 
   // Fetch records that are PD Ready Hold but still invalid
   const records = []
@@ -139,6 +141,7 @@ async function run() {
         // Pass null values explicitly to clear fields (e.g. AI_COST_CHECK reset)
         await table().update(record.id, fixes)
         console.log(`  → Applied ${Object.keys(fixes).length} fix(es)`)
+        logger.log({ itemNumber, website: f[FIELDS.WEBSITE], outcome: unfixable.length === 0 ? 'Fixed' : 'Partial', fieldsWritten: Object.keys(fixes), missingFields: unfixable })
 
         if (unfixable.length === 0) {
           results.fixed++
@@ -161,9 +164,11 @@ async function run() {
       }
       results.flagged++
       console.log(`  ✗ No auto-fix available: ${unfixable.join('; ')}`)
+      logger.log({ itemNumber, website: f[FIELDS.WEBSITE], outcome: 'Flagged', missingFields: unfixable })
     }
   }
 
+  await logger.finish(results)
   console.log(`\n[Validate] Done — Fixed: ${results.fixed}, Partially fixed: ${results.partial}, Flagged for manual: ${results.flagged}`)
 }
 

@@ -8,6 +8,7 @@ import {
   writeBrand,
 } from '../lib/airtable.js'
 import { extractBrandCandidate } from '../lib/parser.js'
+import { WorkerLogger } from '../lib/logger.js'
 import { FIELDS } from '../config/fields.js'
 
 const BATCH_SIZE = parseInt(process.env.BRAND_BATCH_SIZE || '50')
@@ -15,6 +16,7 @@ const CONFIDENCE_THRESHOLD = 0.85 // Fuse.js score is 0–1, lower = better matc
 
 async function run() {
   console.log(`[Brand Resolution] Starting run at ${new Date().toISOString()}`)
+  const logger = new WorkerLogger('brand')
 
   // Load all brands into memory for matching
   console.log('[Brand Resolution] Loading BQ Brands...')
@@ -75,6 +77,7 @@ async function run() {
     try {
       await writeBrand(record.id, best.item.title)
       console.log(`  MATCH ${itemNumber} → "${best.item.correctSpelling}" (${(score * 100).toFixed(0)}%)`)
+      logger.log({ itemNumber, outcome: 'Fixed', brand: best.item.correctSpelling })
       matched++
     } catch (err) {
       console.error(`  ERROR writing brand for ${itemNumber}:`, err.message)
@@ -82,6 +85,7 @@ async function run() {
     }
   }
 
+  await logger.finish({ matched, skipped })
   console.log(`[Brand Resolution] Done — matched: ${matched}, skipped: ${skipped}`)
 }
 

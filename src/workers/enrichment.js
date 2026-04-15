@@ -11,12 +11,14 @@ import { lookupByUPC as keepaLookupByUPC, lookupByASIN, searchProduct as keepaSe
 import { enrichRecord } from '../lib/claude.js'
 import { buildWritePayload } from '../lib/fieldWriter.js'
 import { parseItemNumber, cleanUPC } from '../lib/parser.js'
+import { WorkerLogger } from '../lib/logger.js'
 import { FIELDS, WEBSITE, FOOTWEAR_STORES, AI_STATUS } from '../config/fields.js'
 
 const BATCH_SIZE = parseInt(process.env.ENRICH_BATCH_SIZE || '20')
 
 async function run() {
   console.log(`[Enrichment] Starting run at ${new Date().toISOString()}`)
+  const logger = new WorkerLogger('enrich')
 
   const records = await getEnrichmentQueue(BATCH_SIZE)
   console.log(`[Enrichment] Processing ${records.length} records`)
@@ -40,13 +42,26 @@ async function run() {
       if (result.validationIssues?.length) {
         console.log(`  ⚠ Validation: ${result.validationIssues.join('; ')}`)
       }
+      logger.log({
+        itemNumber,
+        website: record.fields[FIELDS.WEBSITE],
+        brand: record.fields[FIELDS.BRAND_CORRECT_SPELL] || record.fields[FIELDS.BRAND],
+        outcome: result.status,
+        sourcesUsed: result.sourcesUsed,
+        fieldsWritten: result.fieldsWritten,
+        missingFields: result.missingFields,
+        validationWarnings: result.validationIssues,
+        priceWritten: result.priceWritten,
+      })
     } catch (err) {
       console.error(`  ERROR processing ${itemNumber}:`, err.message)
       results.error++
       await safeWriteNotFound(record.id, err.message)
+      logger.log({ itemNumber, website: record.fields[FIELDS.WEBSITE], outcome: 'Error', errorMessage: err.message })
     }
   }
 
+  await logger.finish(results)
   console.log(`\n[Enrichment] Done — Complete: ${results.complete}, Partial: ${results.partial}, Not Found: ${results.notFound}, Errors: ${results.error}`)
 }
 
@@ -244,7 +259,7 @@ async function enrichWithSources(recordId, recordContext, partialAirtableData) {
 
   await writeEnrichmentFields(recordId, fields)
 
-  return { status, missingFields, validationIssues }
+  return { status, missingFields, validationIssues, sourcesUsed: sources.map(s => s.type), fieldsWritten: Object.keys(fields || {}), priceWritten: claudeOutput.price || null }
 }
 
 // Build a source object from existing Airtable data on the record

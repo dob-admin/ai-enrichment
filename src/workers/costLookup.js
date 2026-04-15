@@ -9,6 +9,7 @@ import {
   COST_FIX,
 } from '../config/fields.js'
 import { lookupByItemNumber } from '../lib/goflow.js'
+import { WorkerLogger } from '../lib/logger.js'
 import { parseItemNumber, cleanUPC } from '../lib/parser.js'
 
 const base = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY })
@@ -63,6 +64,7 @@ async function loadBrandSet() {
 
 async function run() {
   console.log(`[Cost Lookup] Starting run at ${new Date().toISOString()}`)
+  const logger = new WorkerLogger('cost')
 
   // Load brands fresh every run
   const { brandSet, brandKeys } = await loadBrandSet()
@@ -106,6 +108,7 @@ async function run() {
     // ── CASE 1: Cost already valid ────────────────────────────────────────
     if (cost > 0.01) {
       await writeField(record.id, { [FIELDS.AI_COST_CHECK]: AI_COST_CHECK.GOOD })
+      logger.log({ itemNumber, website: f[FIELDS.WEBSITE], brand: f[FIELDS.BRAND_CORRECT_SPELL] || f[FIELDS.BRAND], outcome: 'Good' })
       results.good++
       continue
     }
@@ -121,14 +124,17 @@ async function run() {
         [FIELDS.AI_COST_CHECK]: AI_COST_CHECK.FOUND,
       })
       console.log(`  ✓ Found cost: $${foundCost}`)
+      logger.log({ itemNumber, website: f[FIELDS.WEBSITE], brand: f[FIELDS.BRAND_CORRECT_SPELL] || f[FIELDS.BRAND], outcome: 'Found', costFound: foundCost })
       results.found++
     } else {
       await writeField(record.id, { [FIELDS.AI_COST_CHECK]: AI_COST_CHECK.MISSING })
       console.log(`  ✗ Could not find cost`)
+      logger.log({ itemNumber, website: f[FIELDS.WEBSITE], brand: f[FIELDS.BRAND_CORRECT_SPELL] || f[FIELDS.BRAND], outcome: 'Missing' })
       results.missing++
     }
   }
 
+  await logger.finish(results)
   console.log(`\n[Cost Lookup] Done — Good: ${results.good}, Found: ${results.found}, Missing: ${results.missing}, Skipped: ${results.skipped}`)
 }
 
