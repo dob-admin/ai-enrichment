@@ -34,8 +34,7 @@ async function fetchQueue() {
       NOT({${FIELDS.WEBSITE}} = 'ignore'),
       NOT({${FIELDS.WEBSITE}} = ''),
       {${FIELDS.SHOPIFY_PRODUCT_ID}} = BLANK(),
-      NOT({${FIELDS.LOOP_STATUS}} = '${LOOP_STATUS.DONE}'),
-      NOT({${FIELDS.LOOP_STATUS}} = '${LOOP_STATUS.NEEDS_VA}')
+      OR({${FIELDS.LOOP_STATUS}} = BLANK(), {${FIELDS.LOOP_STATUS}} = '${LOOP_STATUS.PENDING}')
     )`,
     fields: [
       FIELDS.ITEM_NUMBER,
@@ -85,13 +84,10 @@ function extractUPCFromString(str) {
 
 // ─── Cost resolution ──────────────────────────────────────────────────────────
 function hasCost(fields) {
-  const costCheck = fields[FIELDS.AI_COST_CHECK]?.name
-  const costFix = fields[FIELDS.COST_FIX]?.name
   const cost = fields[FIELDS.ITEM_COST] || 0
-  return (
-    cost > MIN_COST_THRESHOLD &&
-    (costCheck === 'Good' || costCheck === 'Found' || costFix === 'Inputted')
-  )
+  const costFix = fields[FIELDS.COST_FIX]?.name
+  if (costFix === 'No Data') return false
+  return cost > MIN_COST_THRESHOLD
 }
 
 // ─── Write helper ─────────────────────────────────────────────────────────────
