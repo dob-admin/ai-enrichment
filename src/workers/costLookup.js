@@ -80,6 +80,7 @@ async function run({ batchSize } = {}) {
       NOT({${FIELDS.WEBSITE}} = 'ignore'),
       NOT({${FIELDS.WEBSITE}} = ''),
       {${FIELDS.AI_COST_CHECK}} = BLANK(),
+      NOT({${FIELDS.COST_FIX}} = 'No Data'),
       {${FIELDS.SHOPIFY_PRODUCT_ID}} = BLANK()
     )`,
     fields: [

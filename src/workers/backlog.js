@@ -86,7 +86,7 @@ async function exhaustPhase(phaseName, runFn, logger) {
 
   console.log(`[Backlog] ${phaseName} complete — total processed: ${totalProcessed}, total resolved: ${totalResolved}`)
   logger.log({
-    outcome: `${phaseName} phase complete`,
+    outcome: 'Complete',
     fieldsWritten: [],
     missingFields: [],
     validationWarnings: [`rounds: ${round}, processed: ${totalProcessed}, resolved: ${totalResolved}`],

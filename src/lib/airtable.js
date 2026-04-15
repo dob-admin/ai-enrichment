@@ -1,6 +1,6 @@
 // src/lib/airtable.js
 import Airtable from 'airtable'
-import { FIELDS, AI_COST_CHECK, COST_FIX } from '../config/fields.js'
+import { FIELDS, AI_COST_CHECK, COST_FIX, AI_STATUS, PD_STATUS } from '../config/fields.js'
 
 const base = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY })
   .base(process.env.AIRTABLE_BASE_ID)
@@ -39,11 +39,6 @@ export async function getMissingBrandRecords(limit = 50) {
 export async function getEnrichmentQueue(limit = 20) {
   const records = []
 
-  // AI_STATUS field may not exist yet — handle gracefully
-  const statusFilter = process.env.AI_STATUS_FIELD_ID
-    ? `{${FIELDS.AI_STATUS}} = BLANK()`
-    : `TRUE()`
-
   // Cost gate — only enrich records with confirmed cost
   const costGate = `OR(
     {${FIELDS.AI_COST_CHECK}} = 'Good',
@@ -51,11 +46,23 @@ export async function getEnrichmentQueue(limit = 20) {
     {${FIELDS.COST_FIX}} = 'Inputted'
   )`
 
+  // First pass: no AI status yet + cost confirmed
+  // AI_STATUS field may not exist yet on fresh deploys — handle gracefully
+  const firstPass = process.env.AI_STATUS_FIELD_ID
+    ? `AND({${FIELDS.AI_STATUS}} = BLANK(), ${costGate})`
+    : `AND(TRUE(), ${costGate})`
+
+  // Second pass: VA filled in missing fields and marked Complete
+  // Guard against re-queuing if Claude already wrote Complete on a prior attempt
+  const vaPass = `AND(
+    {${FIELDS.PD_ENRICHMENT_STATUS}} = '${PD_STATUS.COMPLETE}',
+    NOT({${FIELDS.AI_STATUS}} = '${AI_STATUS.COMPLETE}')
+  )`
+
   await table().select({
     returnFieldsByFieldId: true,
     filterByFormula: `AND(
-      ${statusFilter},
-      ${costGate},
+      OR(${firstPass}, ${vaPass}),
       {${FIELDS.TOTAL_INVENTORY}} > 0,
       {${FIELDS.PD_READY}} = 0,
       {${FIELDS.PD_READY_HOLD}} = 0,
@@ -90,6 +97,7 @@ export async function getEnrichmentQueue(limit = 20) {
       FIELDS.BRAND_SITE,
       FIELDS.OTHER_SITE,
       FIELDS.ITEM_COST,
+      FIELDS.PD_ENRICHMENT_STATUS,
     ],
     maxRecords: limit,
   }).eachPage((page, next) => {

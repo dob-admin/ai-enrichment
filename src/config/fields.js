@@ -87,6 +87,12 @@ export const FIELDS = {
   PD_READY_HOLD:        'fldhMJKOKLtxOnlmi',  // PD READY (hold) — script writes this
   PD_ESCALATE:          'fldi67XUeA00o6oT0',  // PD Escalate
   PD_ESCALATE_REASON:   'fldKq4JdfMgAMlqf7',  // PD Escalate Reason
+  PD_ENRICH_STATUS:     'fldzkxLvkmKdnYjW0',  // PD Enrichment Status (VA: Complete/Missing)
+  PD_MISSING_FIELDS:    'fld6QR8vPbpp4YBjh',  // PD Missing Fields (VA fills when Missing)
+
+  // VA enrichment tracking
+  PD_ENRICHMENT_STATUS: 'fldzkxLvkmKdnYjW0',  // PD Enrichment Status (VA: Complete/Missing)
+  PD_MISSING_FIELDS:    'fld6QR8vPbpp4YBjh',  // PD Missing Fields (VA free text)
 
   // URLs
   BRAND_SITE:           'flddPgrETFTU3Wj5g',  // Brand Site
@@ -149,6 +155,18 @@ export const AI_STATUS = {
   COMPLETE:   'Complete',
   PARTIAL:    'Partial',
   NOT_FOUND:  'Not Found',
+}
+
+// PD Enrichment Status values (VA column — VA sets after manual work)
+export const PD_ENRICH_STATUS = {
+  COMPLETE: 'Complete', // VA finished filling fields — re-queue for Claude second pass
+  MISSING:  'Missing',  // VA also couldn't complete it — fill PD Missing Fields, stays manual
+}
+
+// PD Enrichment Status values (VA column)
+export const PD_STATUS = {
+  COMPLETE: 'Complete',
+  MISSING:  'Missing',
 }
 
 // AI Cost Check values

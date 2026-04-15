@@ -12389,3 +12389,13 @@ export const TAXONOMY = {
   "Vehicles & Parts > Vehicles > Watercraft > Sailboats": "3087",
   "Vehicles & Parts > Vehicles > Watercraft > Yachts": "5644"
 }
+
+/**
+ * Look up the Google Shopping category ID for a given Shopify taxonomy path.
+ * @param {string} taxonomyPath - Full taxonomy path string (e.g. "Apparel & Accessories > Shoes")
+ * @returns {string|null} Google Shopping category ID, or null if not found
+ */
+export function lookupGoogleCategory(taxonomyPath) {
+  if (!taxonomyPath) return null
+  return TAXONOMY[taxonomyPath] ?? null
+}
