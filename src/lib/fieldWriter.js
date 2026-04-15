@@ -181,7 +181,7 @@ function getRequiredFields(website) {
   switch (website) {
     case WEBSITE.SDO:
     case WEBSITE.REBOUND:
-      return [...base, 'Material', 'Option 1 Value (colorway)', 'Product Images']
+      return [...base, 'Option 1 Value (colorway)', 'Product Images']
     case WEBSITE.LTV:
       return [...base, 'Product Images']
     case WEBSITE.RTV:
