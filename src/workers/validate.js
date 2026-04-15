@@ -2,6 +2,7 @@
 // Worker 4: Validation repair — scans PD Ready Hold records that are still
 // invalid and fixes what it can automatically, flags what it can't
 import 'dotenv/config'
+import { fileURLToPath } from 'url'
 import Airtable from 'airtable'
 import { FIELDS, AI_STATUS, WEBSITE, FOOTWEAR_STORES, AI_COST_CHECK } from '../config/fields.js'
 import { WorkerLogger } from '../lib/logger.js'
@@ -170,9 +171,14 @@ async function run() {
 
   await logger.finish(results)
   console.log(`\n[Validate] Done — Fixed: ${results.fixed}, Partially fixed: ${results.partial}, Flagged for manual: ${results.flagged}`)
+  return { processed: results.fixed + results.partial + results.flagged, resolved: results.fixed + results.partial }
 }
 
-run().catch(err => {
-  console.error('[Validate] Fatal error:', err)
-  process.exit(1)
-})
+export { run }
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  run().catch(err => {
+    console.error('[Validate] Fatal error:', err)
+    process.exit(1)
+  })
+}

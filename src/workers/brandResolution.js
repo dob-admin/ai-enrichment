@@ -1,6 +1,7 @@
 // src/workers/brandResolution.js
 // Worker 1: Resolves missing brand fields by matching item numbers to BQ Brands
 import 'dotenv/config'
+import { fileURLToPath } from 'url'
 import Fuse from 'fuse.js'
 import {
   getMissingBrandRecords,
@@ -87,7 +88,10 @@ async function run() {
 
   await logger.finish({ matched, skipped })
   console.log(`[Brand Resolution] Done — matched: ${matched}, skipped: ${skipped}`)
+  return { processed: matched + skipped, resolved: matched }
 }
+
+export { run }
 
 run().catch(err => {
   console.error('[Brand Resolution] Fatal error:', err)

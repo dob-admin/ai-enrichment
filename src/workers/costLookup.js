@@ -1,6 +1,7 @@
 // src/workers/costLookup.js
 // Worker 5: Cost Lookup — finds missing costs via UPC chain + model sibling matching
 import 'dotenv/config'
+import { fileURLToPath } from 'url'
 import Airtable from 'airtable'
 import {
   FIELDS,
@@ -136,7 +137,10 @@ async function run() {
 
   await logger.finish(results)
   console.log(`\n[Cost Lookup] Done — Good: ${results.good}, Found: ${results.found}, Missing: ${results.missing}, Skipped: ${results.skipped}`)
+  return results
 }
+
+export { run }
 
 async function findCostViaChain(fields, brand, brandSet, brandKeys) {
   const itemNumber = fields[FIELDS.ITEM_NUMBER]
@@ -320,7 +324,9 @@ function esc(str) {
   return str ? str.replace(/'/g, "\\'") : ''
 }
 
-run().catch(err => {
-  console.error('[Cost Lookup] Fatal error:', err)
-  process.exit(1)
-})
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  run().catch(err => {
+    console.error('[Cost Lookup] Fatal error:', err)
+    process.exit(1)
+  })
+}

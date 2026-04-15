@@ -1,5 +1,6 @@
 // src/lib/claude.js
 import Anthropic from '@anthropic-ai/sdk'
+import { withRetry } from './retry.js'
 import { buildSystemPrompt, buildUserMessage } from '../prompts/enrichmentPrompt.js'
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
@@ -10,12 +11,15 @@ export async function enrichRecord(record, sources) {
   const userMessage = buildUserMessage(record, sources)
 
   try {
-    const response = await client.messages.create({
-      model: 'claude-sonnet-4-5',
-      max_tokens: 2000,
-      messages: [{ role: 'user', content: userMessage }],
-      system: systemPrompt,
-    })
+    const response = await withRetry(
+      () => client.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 2000,
+        messages: [{ role: 'user', content: userMessage }],
+        system: systemPrompt,
+      }),
+      'Anthropic enrichRecord'
+    )
 
     const text = response.content
       .filter(b => b.type === 'text')
@@ -42,15 +46,18 @@ export async function enrichRecord(record, sources) {
 
 // Brand classification call — is this brand footwear or general merchandise?
 export async function classifyBrand(brandName) {
-  const response = await client.messages.create({
-    model: 'claude-sonnet-4-5',
-    max_tokens: 100,
-    messages: [{
-      role: 'user',
-      content: `Is the brand "${brandName}" primarily a footwear brand or general merchandise?
+  const response = await withRetry(
+    () => client.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 100,
+      messages: [{
+        role: 'user',
+        content: `Is the brand "${brandName}" primarily a footwear brand or general merchandise?
 Return JSON only: {"type": "footwear" | "general", "confidence": "high" | "medium" | "low"}`,
-    }],
-  })
+      }],
+    }),
+    'Anthropic classifyBrand'
+  )
 
   try {
     const text = response.content[0].text.trim()

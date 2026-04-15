@@ -10,7 +10,8 @@
     "dev:brand": "node --watch src/workers/brandResolution.js",
     "dev:enrich": "node --watch src/workers/enrichment.js",
     "validate": "node src/workers/validate.js",
-    "cost": "node src/workers/costLookup.js"
+    "cost": "node src/workers/costLookup.js",
+    "backlog": "node src/workers/backlog.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",

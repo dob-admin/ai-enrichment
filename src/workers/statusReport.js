@@ -1,6 +1,7 @@
 // src/workers/statusReport.js
 // Worker 3: Hourly status summary
 import 'dotenv/config'
+import { fileURLToPath } from 'url'
 import { getStatusCounts } from '../lib/airtable.js'
 import { WorkerLogger } from '../lib/logger.js'
 
@@ -82,7 +83,11 @@ async function getCostStats() {
   }
 }
 
-run().catch(err => {
-  console.error('[Status Report] Error:', err)
-  process.exit(1)
-})
+export { run }
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  run().catch(err => {
+    console.error('[Status Report] Error:', err)
+    process.exit(1)
+  })
+}

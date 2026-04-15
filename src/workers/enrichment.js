@@ -1,6 +1,7 @@
 // src/workers/enrichment.js
 // Worker 2: AI enrichment pipeline — the main worker
 import 'dotenv/config'
+import { fileURLToPath } from 'url'
 import {
   getEnrichmentQueue,
   findMatchesByModel,
@@ -64,7 +65,10 @@ async function run() {
 
   await logger.finish(results)
   console.log(`\n[Enrichment] Done — Complete: ${results.complete}, Partial: ${results.partial}, Not Found: ${results.notFound}, Errors: ${results.error}`)
+  return { processed: results.complete + results.partial + results.notFound + results.error, resolved: results.complete + results.partial }
 }
+
+export { run }
 
 async function processRecord(record) {
   const fields = record.fields
@@ -387,7 +391,9 @@ function extractProductLevelFields(record) {
   }
 }
 
-run().catch(err => {
-  console.error('[Enrichment] Fatal error:', err)
-  process.exit(1)
-})
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  run().catch(err => {
+    console.error('[Enrichment] Fatal error:', err)
+    process.exit(1)
+  })
+}

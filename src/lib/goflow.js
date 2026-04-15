@@ -4,6 +4,7 @@
 // Auth: Authorization: Bearer {token}
 // Beta endpoints require: X-Beta-Contact header
 import axios from 'axios'
+import { withRetry } from './retry.js'
 
 const getClient = () => axios.create({
   baseURL: `https://${process.env.GOFLOW_SUBDOMAIN}.api.goflow.com/v1`,
@@ -20,25 +21,26 @@ export async function lookupByItemNumber(itemNumber) {
   if (!itemNumber || !process.env.GOFLOW_API_TOKEN) return null
 
   try {
-    // Step 1: Get product
-    const productRes = await getClient().get('/products', {
-      params: { 'filters[item_number:eq]': itemNumber },
-    })
+    // Step 1: Get product — with 429 retry
+    const productRes = await withRetry(
+      () => getClient().get('/products', { params: { 'filters[item_number:eq]': itemNumber } }),
+      `GoFlow /products ${itemNumber}`
+    )
     const products = productRes.data?.data || []
     if (!products.length) return null
 
     const product = products[0]
     const normalized = normalizeGoFlowProduct(product)
 
-    // Step 2: Get listings for this product to find ASIN
+    // Step 2: Get listings for this product to find ASIN — with 429 retry
     try {
-      const listingsRes = await getClient().get('/listings', {
-        params: { 'filters[product.id:eq]': product.id },
-      })
+      const listingsRes = await withRetry(
+        () => getClient().get('/listings', { params: { 'filters[product.id:eq]': product.id } }),
+        `GoFlow /listings ${product.id}`
+      )
       const listings = listingsRes.data?.data || []
 
       // Find Amazon USA listing — ASIN is in store_page_url as /dp/{ASIN}
-      // store_provided_id is the seller SKU, not the ASIN
       const amazonListing = listings.find(l => l.store?.channel === 'amazon_marketplace_usa')
 
       if (amazonListing?.store_page_url) {
@@ -61,16 +63,8 @@ export async function lookupByItemNumber(itemNumber) {
     return normalized
   } catch (err) {
     if (err.response?.status === 404) return null
-    if (err.response?.status === 429) { console.log('  GoFlow rate limit'); return null }
     console.error(`  GoFlow lookup failed for ${itemNumber}:`, err.message)
-    try {
-      await new Promise(r => setTimeout(r, 3000))
-      const retry = await getClient().get('/products', {
-        params: { 'filters[item_number:eq]': itemNumber },
-      })
-      const products = retry.data?.data || []
-      return products.length ? normalizeGoFlowProduct(products[0]) : null
-    } catch { return null }
+    return null
   }
 }
 

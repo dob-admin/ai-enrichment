@@ -1,5 +1,6 @@
 // src/lib/keepa.js
 import axios from 'axios'
+import { withRetry } from './retry.js'
 
 const client = axios.create({
   baseURL: 'https://api.keepa.com',
@@ -32,14 +33,14 @@ export async function searchProduct(query) {
     .slice(0, 100)
   if (!cleanQuery || cleanQuery.length < 5) return null
   try {
-    const r = await client.get('/search', {
-      params: { key: key(), domain: 1, type: 1, term: cleanQuery }
-    })
+    const r = await withRetry(
+      () => client.get('/search', { params: { key: key(), domain: 1, type: 1, term: cleanQuery } }),
+      `Keepa /search "${cleanQuery}"`
+    )
     const asins = r.data?.asinList
     if (!asins?.length) return null
     return await lookupByASIN(asins[0])
   } catch (err) {
-    if (err.response?.status === 429) { console.log('  Keepa rate limit'); return null }
     if (err.response?.status === 500) {
       // Keepa search 500 usually means bad query — log quietly and move on
       console.log(`  - Keepa search: no result (bad query)`)
@@ -52,14 +53,14 @@ export async function searchProduct(query) {
 
 async function _productLookup(params) {
   try {
-    const r = await client.get('/product', {
-      params: { key: key(), domain: 1, ...params }
-    })
+    const r = await withRetry(
+      () => client.get('/product', { params: { key: key(), domain: 1, ...params } }),
+      `Keepa /product`
+    )
     const products = r.data?.products
     if (!products?.length) return null
     return normalizeKeepaProduct(products[0])
   } catch (err) {
-    if (err.response?.status === 429) { console.log('  Keepa rate limit'); return null }
     console.error(`  Keepa lookup failed:`, err.message)
     return null
   }
