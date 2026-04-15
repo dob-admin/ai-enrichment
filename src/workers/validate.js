@@ -14,7 +14,7 @@ const table = () => base(process.env.AIRTABLE_TABLE_ID)
 const delay = (ms) => new Promise(r => setTimeout(r, ms))
 const RATE_DELAY = parseInt(process.env.AIRTABLE_RATE_DELAY_MS || '250')
 
-async function run() {
+async function run({ batchSize } = {}) {
   await exitIfLocked('Validate')
   console.log(`[Validate] Starting run at ${new Date().toISOString()}`)
   const logger = new WorkerLogger('validate')
@@ -53,7 +53,7 @@ async function run() {
       FIELDS.CONDITION_TYPE,
       FIELDS.MANUAL_CONDITION,
     ],
-    maxRecords: 50,
+    maxRecords: batchSize || 50,
   }).eachPage((page, next) => { records.push(...page); next() })
 
   console.log(`[Validate] Found ${records.length} invalid PD Hold records`)

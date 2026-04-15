@@ -18,12 +18,12 @@ import { FIELDS, WEBSITE, FOOTWEAR_STORES, AI_STATUS } from '../config/fields.js
 
 const BATCH_SIZE = parseInt(process.env.ENRICH_BATCH_SIZE || '20')
 
-async function run() {
+async function run({ batchSize } = {}) {
   await exitIfLocked('Enrichment')
   console.log(`[Enrichment] Starting run at ${new Date().toISOString()}`)
   const logger = new WorkerLogger('enrich')
 
-  const records = await getEnrichmentQueue(BATCH_SIZE)
+  const records = await getEnrichmentQueue(batchSize || BATCH_SIZE)
   console.log(`[Enrichment] Processing ${records.length} records`)
 
   const results = { complete: 0, partial: 0, notFound: 0, error: 0 }

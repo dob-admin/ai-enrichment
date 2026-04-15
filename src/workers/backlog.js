@@ -14,22 +14,22 @@ import { acquireLock, releaseLock } from '../lib/lock.js'
 
 async function runCostPhase(logger) {
   const { run } = await import('./costLookup.js')
-  return run({ backlogMode: true })
+  return run({ batchSize: 99999 })
 }
 
 async function runBrandPhase(logger) {
   const { run } = await import('./brandResolution.js')
-  return run({ backlogMode: true })
+  return run({ batchSize: 99999 })
 }
 
 async function runValidatePhase(logger) {
   const { run } = await import('./validate.js')
-  return run({ backlogMode: true })
+  return run({ batchSize: 99999 })
 }
 
 async function runEnrichPhase(logger) {
   const { run } = await import('./enrichment.js')
-  return run({ backlogMode: true })
+  return run({ batchSize: 99999 })
 }
 
 async function runReportPhase() {

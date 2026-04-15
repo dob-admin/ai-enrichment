@@ -16,7 +16,7 @@ import { FIELDS } from '../config/fields.js'
 const BATCH_SIZE = parseInt(process.env.BRAND_BATCH_SIZE || '50')
 const CONFIDENCE_THRESHOLD = 0.85 // Fuse.js score is 0–1, lower = better match
 
-async function run() {
+async function run({ batchSize } = {}) {
   await exitIfLocked('Brand Resolution')
   console.log(`[Brand Resolution] Starting run at ${new Date().toISOString()}`)
   const logger = new WorkerLogger('brand')
@@ -42,7 +42,7 @@ async function run() {
   })
 
   // Fetch records needing brand resolution
-  const records = await getMissingBrandRecords(BATCH_SIZE)
+  const records = await getMissingBrandRecords(batchSize || BATCH_SIZE)
   console.log(`[Brand Resolution] Processing ${records.length} records`)
 
   let matched = 0

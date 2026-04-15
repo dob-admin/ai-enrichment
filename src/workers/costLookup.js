@@ -64,7 +64,7 @@ async function loadBrandSet() {
   return { brandSet, brandKeys }
 }
 
-async function run() {
+async function run({ batchSize } = {}) {
   await exitIfLocked('Cost Lookup')
   console.log(`[Cost Lookup] Starting run at ${new Date().toISOString()}`)
   const logger = new WorkerLogger('cost')
@@ -91,7 +91,7 @@ async function run() {
       FIELDS.UPC_CODE,
       FIELDS.COST_FIX,
     ],
-    maxRecords: BATCH_SIZE,
+    maxRecords: batchSize || BATCH_SIZE,
   }).eachPage((page, next) => { records.push(...page); next() })
 
   console.log(`[Cost Lookup] Processing ${records.length} records`)
