@@ -34,9 +34,6 @@ Before enriching, verify the source matches the record:
 - No gender prefix (Men's, Women's, Kids')
 - No trademark (™) or registered (®) symbols
 - Keep it clean and concise
-${isRTV ? `- For NPCN Used (RTV): append the condition text to end of title
-  Example: "Swiss Army Knife Used Very Good"
-  Condition text options: ${Object.entries(CONDITION_LABELS).map(([k,v]) => `${k} → "${v}"`).join(', ')}` : ''}
 
 ## DESCRIPTION RULES
 Structure EXACTLY as follows:
@@ -89,7 +86,7 @@ Examples:
 Do NOT return a googleShoppingCategory. It is derived automatically from the Shopify Category via taxonomy lookup.
 Set "googleShoppingCategory": null in your output.
 
-${isFootwear ? `## MATERIALS (HARD CONSTRAINT)
+${isFootwear ? `## MATERIALS (FOOTWEAR STORES ONLY — HARD CONSTRAINT)
 ONLY use materials from this approved list:
 ${APPROVED_MATERIALS.join(', ')}
 
@@ -100,16 +97,42 @@ Normalization rules:
 - Thinsulate → Polyester
 - Rubber outsoles → Natural Rubber
 - TPU outsoles → TPU
-- Safety toes (steel/carbon/composite) → NOT materials, do not include
 - Only use Recycled Polyester / Recycled Rubber if explicitly stated
-- Return as array of strings from approved list only` : ''}
+- Return as array of strings from approved list only
 
-## OPTION 1 VALUE (COLORWAY)
-${isFootwear ? `- Always required for SDO and Rebound
-- Use the colorway exactly as listed on the product page
-- Capitalize first letter of each color
-- Multiple colors: use " / " with spaces (e.g. "Black / White / Grey")` : `- Include if product has a color option, leave null if not applicable
-- For NPCN products like electronics, tools, etc. that have no meaningful color — return null`}
+If a material from the source is NOT on the approved list:
+- Do NOT include it
+- Do NOT substitute it with a similar material
+- Do NOT flag or comment on it in validationIssues
+- Simply omit it — an empty array or partial list is perfectly acceptable
+- Material is never a required field` : ''}
+
+## VARIANT OPTIONS — PER STORE RULES
+${website === WEBSITE.SDO ? `Store: SDO (new footwear)
+- Option 1 (colorway): REQUIRED — use the colorway exactly as listed, capitalize first letter of each color, multiple colors use " / " (e.g. "Black / White")
+- Option 2 (size): set automatically by formula — NEVER write
+- Option 3 (width): optional — only write if explicitly stated in source, leave null if unknown` : ''}
+${website === WEBSITE.REBOUND ? `Store: Rebound (used footwear)
+- Option 1 (colorway): REQUIRED — use the colorway exactly as listed, capitalize first letter of each color, multiple colors use " / " (e.g. "Black / White")
+- Option 2 (size): set automatically by formula — NEVER write
+- Option 3 (width): optional — only write if explicitly stated in source, leave null if unknown` : ''}
+${website === WEBSITE.LTV ? `Store: NPCN LTV (new general merchandise)
+- Option 1 (color): include if the product has a meaningful color variant, null if not applicable (electronics, tools, etc.)
+- Option 2 (size): set automatically if applicable — NEVER write
+- Option 3 (detail): free slot — use for any additional variant info if genuinely useful (e.g. scent, style, pack size), null if not needed` : ''}
+${website === WEBSITE.RTV ? `Store: NPCN RTV (used general merchandise)
+- Option 1 (color): include if the product has a meaningful color variant, null if not applicable
+- Option 2 (size): set automatically if applicable — NEVER write
+- Option 3 (condition): REQUIRED — must be set to the exact condition text for this item` : ''}
+
+## DO NOT FLAG — EVER
+Never include any of the following in validationIssues:
+- The Website or store assignment (SDO, Rebound, NPCN LTV, NPCN RTV) — this is set upstream and is not your concern
+- Missing or null Option 3 on SDO — width is optional
+- Missing or null Option 3 on Rebound — width is optional
+- Missing or null Option 3 on NPCN LTV — detail is optional
+- Missing or absent materials — material is never required
+- Any inference or substitution you made for materials — silently omit unapproved materials, do not comment
 
 ## CONFIDENCE LEVEL
 Return "high" if you found a reliable source with complete data and it clearly matches.
@@ -167,7 +190,7 @@ ${sourceText || 'No sources found — return Not Found status'}
   "price": number or null,
   "imageUrls": ["array", "of", "url", "strings"],
   "confidence": "high" | "medium" | "low",
-  "missingFields": ["only use: Title, Description, SEO Description, Shopify Category, Material, Option 1 Value (colorway), Product Images, price, Option 3 Custom Value (used condition)"],
+  "missingFields": ["only use: Title, Description, SEO Description, Shopify Category, Option 1 Value (colorway), Product Images, price, Option 3 Custom Value (used condition)"],
   "validationIssues": ["list of any sanity check concerns"],
   "sourceUsed": "description of which source was used and why"
 }`

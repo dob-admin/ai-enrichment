@@ -87,8 +87,6 @@ export const FIELDS = {
   PD_READY_HOLD:        'fldhMJKOKLtxOnlmi',  // PD READY (hold) — script writes this
   PD_ESCALATE:          'fldi67XUeA00o6oT0',  // PD Escalate
   PD_ESCALATE_REASON:   'fldKq4JdfMgAMlqf7',  // PD Escalate Reason
-  PD_ENRICH_STATUS:     'fldzkxLvkmKdnYjW0',  // PD Enrichment Status (VA: Complete/Missing)
-  PD_MISSING_FIELDS:    'fld6QR8vPbpp4YBjh',  // PD Missing Fields (VA fills when Missing)
 
   // VA enrichment tracking
   PD_ENRICHMENT_STATUS: 'fldzkxLvkmKdnYjW0',  // PD Enrichment Status (VA: Complete/Missing)
@@ -103,8 +101,12 @@ export const FIELDS = {
   SYNC_ERROR:           'fldCEsm48AcT5swhK',  // Sync Error
 
   // AI enrichment — resolved at runtime after dotenv loads
-  get AI_STATUS()  { return process.env.AI_STATUS_FIELD_ID },
-  get AI_MISSING() { return process.env.AI_MISSING_FIELDS_FIELD_ID },
+  AI_STATUS:            'fldsJ3tp3XPmd82NR',  // AI Enrichment Status
+  AI_MISSING:           'fldmgcC2eAxKRyUKt',  // AI Missing Fields
+
+  ENRICHMENT_ATTEMPTS:  'fldtIfSjEzvnMTGvZ',  // Enrichment Attempts
+  LOOP_STATUS:          'fldV9c74eMKeflICI',  // Loop Status (Pending/Needs VA/Done)
+  VA_NEEDED:            'fldbdDGZxRjPtvqZQ',  // VA Needed (blocking reason)
 
   // Cost tracking
   AI_COST_CHECK:        'fldjJAFcnpntaN7l4',  // AI Cost Check (Good/Found/Missing)
@@ -158,12 +160,6 @@ export const AI_STATUS = {
 }
 
 // PD Enrichment Status values (VA column — VA sets after manual work)
-export const PD_ENRICH_STATUS = {
-  COMPLETE: 'Complete', // VA finished filling fields — re-queue for Claude second pass
-  MISSING:  'Missing',  // VA also couldn't complete it — fill PD Missing Fields, stays manual
-}
-
-// PD Enrichment Status values (VA column)
 export const PD_STATUS = {
   COMPLETE: 'Complete',
   MISSING:  'Missing',
@@ -246,4 +242,11 @@ export const CATEGORY_MAPPING = {
     'Sandals':             { shopify: 'aa-8-2-2', google: '187' },
     'Backpacks':           { shopify: 'aa-5-4-17',google: '3032' },
   },
+}
+
+// Enrichment loop tracking
+export const LOOP_STATUS = {
+  PENDING:  'Pending',
+  NEEDS_VA: 'Needs VA',
+  DONE:     'Done',
 }

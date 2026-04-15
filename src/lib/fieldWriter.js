@@ -153,10 +153,8 @@ export function buildWritePayload(claudeOutput, record) {
   }
 
   // Write AI status fields if field IDs are configured
-  if (process.env.AI_STATUS_FIELD_ID) {
-    fields[FIELDS.AI_STATUS] = status
-  }
-  if (process.env.AI_MISSING_FIELDS_FIELD_ID && dedupedMissing.length > 0) {
+  fields[FIELDS.AI_STATUS] = status
+  if (dedupedMissing.length > 0) {
     fields[FIELDS.AI_MISSING] = dedupedMissing.join(', ')
   }
 

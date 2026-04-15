@@ -103,7 +103,7 @@ function normalizeGoFlowProduct(product) {
       description: details.description,
       category: details.category,
       condition: details.condition,
-      identifiers,
+      // identifiers excluded — upc/ean/mpn already extracted as top-level fields above
     },
   }
 }

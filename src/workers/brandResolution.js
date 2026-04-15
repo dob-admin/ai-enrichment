@@ -16,8 +16,8 @@ import { FIELDS } from '../config/fields.js'
 const BATCH_SIZE = parseInt(process.env.BRAND_BATCH_SIZE || '50')
 const CONFIDENCE_THRESHOLD = 0.85 // Fuse.js score is 0–1, lower = better match
 
-async function run({ batchSize } = {}) {
-  await exitIfLocked('Brand Resolution')
+async function run({ batchSize, skipLockCheck } = {}) {
+  if (!skipLockCheck) await exitIfLocked('Brand Resolution')
   console.log(`[Brand Resolution] Starting run at ${new Date().toISOString()}`)
   const logger = new WorkerLogger('brand')
 
@@ -95,7 +95,9 @@ async function run({ batchSize } = {}) {
 
 export { run }
 
-run().catch(err => {
-  console.error('[Brand Resolution] Fatal error:', err)
-  process.exit(1)
-})
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  run().catch(err => {
+    console.error('[Brand Resolution] Fatal error:', err)
+    process.exit(1)
+  })
+}

@@ -48,9 +48,7 @@ export async function getEnrichmentQueue(limit = 20) {
 
   // First pass: no AI status yet + cost confirmed
   // AI_STATUS field may not exist yet on fresh deploys — handle gracefully
-  const firstPass = process.env.AI_STATUS_FIELD_ID
-    ? `AND({${FIELDS.AI_STATUS}} = BLANK(), ${costGate})`
-    : `AND(TRUE(), ${costGate})`
+  const firstPass = `AND({${FIELDS.AI_STATUS}} = BLANK(), ${costGate})`
 
   // Second pass: VA filled in missing fields and marked Complete
   // Guard against re-queuing if Claude already wrote Complete on a prior attempt
@@ -189,7 +187,6 @@ export async function writeEnrichmentFields(recordId, fields) {
 export async function getStatusCounts() {
   const counts = { complete: 0, partial: 0, notFound: 0, pending: 0 }
 
-  if (!process.env.AI_STATUS_FIELD_ID) return counts
 
   const allRecords = []
   await table().select({

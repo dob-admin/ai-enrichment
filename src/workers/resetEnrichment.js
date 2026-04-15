@@ -1,34 +1,27 @@
 // src/workers/resetEnrichment.js
-// ONE-SHOT: Clears all AI enrichment fields on records where AI Status is set.
-// Run manually from Railway or locally. Exits when done.
-//
-// Step 1 — Fetch all records where AI Enrichment Status is not empty
-// Step 2 — Clear 13 fields (12 → null/[], 1 → false) in batches of 10
-// Step 3 — Report final count
-//
-// SAFE: Never touches cost, brand, website, condition, item number,
-//       size/width fields, SEO Title, Price, or PD Ready (final checkbox).
+// ONE-SHOT: Clears all AI enrichment fields on records where AI Status is set,
+// EXCEPT records where PD Ready is checked OR both valid columns say YES.
 
 import 'dotenv/config'
 import Airtable from 'airtable'
 
-// ─── Field IDs to clear ───────────────────────────────────────────────────────
+const AI_STATUS_FIELD_ID        = 'fldsJ3tp3XPmd82NR'
+const AI_MISSING_FIELD_ID       = 'fldmgcC2eAxKRyUKt'
+const TITLE_FIELD_ID            = 'fldhbkyCE3ZK3huqf'
+const DESCRIPTION_FIELD_ID      = 'fld8s6bi94sxJiqZE'
+const SEO_DESC_FIELD_ID         = 'fldtmIK6WVA93On8C'
+const SHOPIFY_CAT_FIELD_ID      = 'fldE4yEqLZKe5UgPZ'
+const GOOGLE_CAT_FIELD_ID       = 'fldPGP1Xxrf75nC6U'
+const MATERIAL_FIELD_ID         = 'fldojvxXhW2UUH0My'
+const OPTION_1_VALUE_FIELD_ID   = 'fld3Wla73i6UIMOfF'
+const SDO_COLOR_FIELD_ID        = 'fld5FU5pikJMxFCag'
+const PRODUCT_IMAGES_FIELD_ID   = 'fldfOrq8jm703glZC'
+const VARIANT_IMG_IDX_FIELD_ID  = 'fldYLJxgnXASagxsN'
+const PD_READY_HOLD_FIELD_ID    = 'fldhMJKOKLtxOnlmi'
+const PD_READY_FIELD_ID         = 'fldeNIKuNPpDg12AW'
+const PRODUCT_INFO_VALID_ID     = 'fld5ngh2MlP8N6dpt'
+const VARIANT_INFO_VALID_ID     = 'fldrcRaE8mI1iNFkg'
 
-const AI_STATUS_FIELD_ID        = 'fldsJ3tp3XPmd82NR'  // AI Enrichment Status  → null
-const AI_MISSING_FIELD_ID       = 'fldmgcC2eAxKRyUKt'  // AI Missing Fields     → null
-const TITLE_FIELD_ID            = 'fldhbkyCE3ZK3huqf'  // Title                 → null
-const DESCRIPTION_FIELD_ID      = 'fld8s6bi94sxJiqZE'  // Description           → null
-const SEO_DESC_FIELD_ID         = 'fldtmIK6WVA93On8C'  // SEO Description       → null
-const SHOPIFY_CAT_FIELD_ID      = 'fldE4yEqLZKe5UgPZ'  // Shopify Category      → null
-const GOOGLE_CAT_FIELD_ID       = 'fldPGP1Xxrf75nC6U'  // Google Category       → null
-const MATERIAL_FIELD_ID         = 'fldojvxXhW2UUH0My'  // Material              → []
-const OPTION_1_VALUE_FIELD_ID   = 'fld3Wla73i6UIMOfF'  // Option 1 Value        → null
-const SDO_COLOR_FIELD_ID        = 'fld5FU5pikJMxFCag'  // SDO Color             → null
-const PRODUCT_IMAGES_FIELD_ID   = 'fldfOrq8jm703glZC'  // Product Images        → []
-const VARIANT_IMG_IDX_FIELD_ID  = 'fldYLJxgnXASagxsN'  // Variant Image Index   → null
-const PD_READY_HOLD_FIELD_ID    = 'fldhMJKOKLtxOnlmi'  // PD Ready Hold         → false
-
-// The payload applied to every matched record
 const CLEAR_PAYLOAD = {
   [AI_STATUS_FIELD_ID]:        null,
   [AI_MISSING_FIELD_ID]:       null,
@@ -37,74 +30,84 @@ const CLEAR_PAYLOAD = {
   [SEO_DESC_FIELD_ID]:         null,
   [SHOPIFY_CAT_FIELD_ID]:      null,
   [GOOGLE_CAT_FIELD_ID]:       null,
-  [MATERIAL_FIELD_ID]:         [],    // multipleSelects — must be empty array
+  [MATERIAL_FIELD_ID]:         [],
   [OPTION_1_VALUE_FIELD_ID]:   null,
   [SDO_COLOR_FIELD_ID]:        null,
-  [PRODUCT_IMAGES_FIELD_ID]:   [],    // multipleAttachments — must be empty array
+  [PRODUCT_IMAGES_FIELD_ID]:   [],
   [VARIANT_IMG_IDX_FIELD_ID]:  null,
-  [PD_READY_HOLD_FIELD_ID]:    false, // checkbox — false, not null
+  [PD_READY_HOLD_FIELD_ID]:    false,
 }
 
-// ─── Config ───────────────────────────────────────────────────────────────────
-
-const RATE_DELAY    = parseInt(process.env.AIRTABLE_RATE_DELAY_MS || '250')
-const BATCH_SIZE    = 10  // Airtable max records per update call
-
-const delay = (ms) => new Promise(r => setTimeout(r, ms))
-
-// ─── Main ─────────────────────────────────────────────────────────────────────
+const RATE_DELAY = parseInt(process.env.AIRTABLE_RATE_DELAY_MS || '250')
+const BATCH_SIZE = 10
+const delay = ms => new Promise(r => setTimeout(r, ms))
 
 async function run() {
   const startTime = Date.now()
 
-  // Validate env
-  if (!process.env.AIRTABLE_API_KEY)   throw new Error('Missing AIRTABLE_API_KEY')
-  if (!process.env.AIRTABLE_BASE_ID)   throw new Error('Missing AIRTABLE_BASE_ID')
-  if (!process.env.AIRTABLE_TABLE_ID)  throw new Error('Missing AIRTABLE_TABLE_ID')
+  if (!process.env.AIRTABLE_API_KEY) throw new Error('Missing AIRTABLE_API_KEY')
+  if (!process.env.AIRTABLE_BASE_ID) throw new Error('Missing AIRTABLE_BASE_ID')
+  if (!process.env.AIRTABLE_TABLE_ID) throw new Error('Missing AIRTABLE_TABLE_ID')
 
-  const base  = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY }).base(process.env.AIRTABLE_BASE_ID)
+  const base = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY }).base(process.env.AIRTABLE_BASE_ID)
   const table = base(process.env.AIRTABLE_TABLE_ID)
 
   console.log(`\n${'═'.repeat(55)}`)
   console.log(`[Reset] Starting enrichment field reset`)
+  console.log(`[Reset] Skipping: PD Ready = true OR both valid = YES`)
   console.log(`[Reset] ${new Date().toISOString()}`)
   console.log(`${'═'.repeat(55)}`)
 
-  // ── Step 1: Fetch all record IDs where AI Status is set ──────────────────
-
-  console.log(`\n[Reset] Step 1 — Fetching records where AI Enrichment Status is not empty...`)
+  console.log(`\n[Reset] Fetching records where AI Status is set...`)
 
   const recordIds = []
+  let skipped = 0
 
   await table.select({
     returnFieldsByFieldId: true,
     filterByFormula: `NOT({${AI_STATUS_FIELD_ID}} = BLANK())`,
-    fields: [AI_STATUS_FIELD_ID],  // fetch only the filter field — we only need IDs
+    fields: [
+      AI_STATUS_FIELD_ID,
+      PD_READY_FIELD_ID,
+      PRODUCT_INFO_VALID_ID,
+      VARIANT_INFO_VALID_ID,
+    ],
   }).eachPage((page, next) => {
-    for (const r of page) recordIds.push(r.id)
-    process.stdout.write(`\r  Fetched ${recordIds.length} records...`)
+    for (const r of page) {
+      const f = r.fields
+      const pdReady = f[PD_READY_FIELD_ID]
+      const productValid = f[PRODUCT_INFO_VALID_ID]
+      const variantValid = f[VARIANT_INFO_VALID_ID]
+
+      // Skip if PD Ready is checked
+      if (pdReady) { skipped++; continue }
+
+      // Skip if both valid columns say YES
+      if (productValid === 'YES' && variantValid === 'YES') { skipped++; continue }
+
+      recordIds.push(r.id)
+    }
+    process.stdout.write(`\r  Fetched ${recordIds.length + skipped} records (${skipped} protected)...`)
     next()
   })
 
-  console.log(`\n[Reset] Found ${recordIds.length} records to clear.`)
+  console.log(`\n[Reset] Found ${recordIds.length} records to clear, ${skipped} protected (skipped)`)
 
   if (recordIds.length === 0) {
-    console.log(`[Reset] Nothing to do. Exiting.`)
+    console.log(`[Reset] Nothing to clear. Exiting.`)
     return
   }
 
-  // ── Step 2: Clear fields in batches of 10 ────────────────────────────────
+  console.log(`\n[Reset] Clearing fields in batches of ${BATCH_SIZE}...`)
 
-  console.log(`\n[Reset] Step 2 — Clearing fields in batches of ${BATCH_SIZE}...`)
-
-  let cleared  = 0
-  let errors   = 0
+  let cleared = 0
+  let errors = 0
   const totalBatches = Math.ceil(recordIds.length / BATCH_SIZE)
 
   for (let i = 0; i < recordIds.length; i += BATCH_SIZE) {
-    const batch     = recordIds.slice(i, i + BATCH_SIZE)
-    const batchNum  = Math.floor(i / BATCH_SIZE) + 1
-    const updates   = batch.map(id => ({ id, fields: CLEAR_PAYLOAD }))
+    const batch = recordIds.slice(i, i + BATCH_SIZE)
+    const batchNum = Math.floor(i / BATCH_SIZE) + 1
+    const updates = batch.map(id => ({ id, fields: CLEAR_PAYLOAD }))
 
     try {
       await delay(RATE_DELAY)
@@ -114,22 +117,17 @@ async function run() {
     } catch (err) {
       errors += batch.length
       console.error(`\n  ERROR batch ${batchNum}: ${err.message}`)
-      // Continue — don't abort the whole run for one bad batch
     }
   }
-
-  // ── Step 3: Final report ──────────────────────────────────────────────────
 
   const durationS = ((Date.now() - startTime) / 1000).toFixed(1)
 
   console.log(`\n\n${'═'.repeat(55)}`)
   console.log(`[Reset] COMPLETE`)
-  console.log(`  Records matched:  ${recordIds.length}`)
-  console.log(`  Records cleared:  ${cleared}`)
-  if (errors > 0) {
-    console.log(`  Errors:           ${errors}  ← check logs above`)
-  }
-  console.log(`  Duration:         ${durationS}s`)
+  console.log(`  Records protected:  ${skipped}`)
+  console.log(`  Records cleared:    ${cleared}`)
+  if (errors > 0) console.log(`  Errors:             ${errors}`)
+  console.log(`  Duration:           ${durationS}s`)
   console.log(`${'═'.repeat(55)}\n`)
 }
 

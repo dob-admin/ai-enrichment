@@ -3,33 +3,22 @@
 builder = "nixpacks"
 
 [[services]]
-name = "worker-cost"
-startCommand = "npm run cost"
-
+name = "worker-loop"
+startCommand = "npm run loop"
 [services.deploy]
-cronSchedule = "*/20 * * * *"
-restartPolicyType = "never"
+restartPolicyType = "always"
+restartPolicyMaxRetries = 10
 
 [[services]]
 name = "worker-brand"
 startCommand = "npm run brand"
-
 [services.deploy]
 cronSchedule = "3,23,43 * * * *"
 restartPolicyType = "never"
 
 [[services]]
-name = "worker-enrich"
-startCommand = "npm run enrich"
-
-[services.deploy]
-cronSchedule = "6,26,46 * * * *"
-restartPolicyType = "never"
-
-[[services]]
 name = "worker-report"
 startCommand = "npm run report"
-
 [services.deploy]
 cronSchedule = "0 * * * *"
 restartPolicyType = "never"
