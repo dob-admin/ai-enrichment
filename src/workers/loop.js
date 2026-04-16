@@ -300,9 +300,14 @@ async function processRecord(record) {
   // ── PHASE 4: CHECK FORMULAS ───────────────────────────────────────────────
   // Re-fetch to get updated formula values
   await delay(RATE_DELAY * 2) // give Airtable a moment to recalculate
-  const fresh = await table().find(record.id)
-  const productValid = fresh.fields[FIELDS.PRODUCT_INFO_VALID]
-  const variantValid = fresh.fields[FIELDS.VARIANT_INFO_VALID]
+  const freshRecords = await table().select({
+    returnFieldsByFieldId: true,
+    filterByFormula: `RECORD_ID() = '${record.id}'`,
+    fields: [FIELDS.PRODUCT_INFO_VALID, FIELDS.VARIANT_INFO_VALID, FIELDS.PRODUCT_INVALID_WHY, FIELDS.VARIANT_INVALID_WHY],
+  }).firstPage()
+  const fresh = freshRecords[0]
+  const productValid = fresh?.fields[FIELDS.PRODUCT_INFO_VALID]
+  const variantValid = fresh?.fields[FIELDS.VARIANT_INFO_VALID]
 
   console.log(`  → Product Valid: ${productValid} | Variant Valid: ${variantValid}`)
 
