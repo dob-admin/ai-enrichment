@@ -7,11 +7,12 @@
 //   - Brand Worker Status is empty
 //
 // For each record:
-//   - Extract brand candidate from item number
-//   - Fuzzy-match against BQ Brands (Title + Correct Spelling)
-//   - If matched above confidence threshold: write Brand = Correct Spelling,
-//     Brand Name Match = Correct Spelling, Brand Worker Status = Found
-//   - If no match (or no candidate extractable): write Brand Name Match = candidate (or blank),
+//   - Extract ordered list of brand candidates from item number
+//   - Fuzzy-match each candidate against BQ Brands (Title + Correct Spelling)
+//   - Pick the highest-confidence hit across all candidates
+//   - If best hit >= threshold: write Brand = matched Correct Spelling,
+//     Brand Name Match = matched Correct Spelling, Brand Worker Status = Found
+//   - Otherwise: write Brand Name Match = candidates tried (comma-separated),
 //     Brand Worker Status = Not Found
 //
 // Worker ignores any record where Brand Worker Status is already populated.
@@ -26,11 +27,11 @@ import {
   loadAllBrands,
   writeBrandResult,
 } from '../lib/airtable.js'
-import { extractBrandCandidate } from '../lib/parser.js'
+import { extractBrandCandidates } from '../lib/parser.js'
 import { WorkerLogger } from '../lib/logger.js'
 import { FIELDS, BRAND_WORKER_STATUS } from '../config/fields.js'
 
-const CONFIDENCE_THRESHOLD = 0.85 // Fuse.js score is 0–1, lower = better match
+const CONFIDENCE_THRESHOLD = 0.85 // Fuse.js confidence score 0-1, higher = better match
 
 async function run({ skipLockCheck } = {}) {
   if (!skipLockCheck) await exitIfLocked('Brand Resolution')
@@ -42,8 +43,8 @@ async function run({ skipLockCheck } = {}) {
   const allBrands = await loadAllBrands()
   console.log(`[Brand Resolution] Loaded ${allBrands.length} brands`)
 
-  // Build fuzzy search index on Title + Correct Spelling
-  // Title holds the raw/variant spellings (including UPC entries);
+  // Build fuzzy search index on Title + Correct Spelling.
+  // Title holds the raw/variant spellings (including UPC entries as-is);
   // Correct Spelling is the canonical value we write to the Brand field.
   const brandIndex = allBrands
     .map(r => ({
@@ -69,10 +70,10 @@ async function run({ skipLockCheck } = {}) {
 
   for (const record of records) {
     const itemNumber = record.fields[FIELDS.ITEM_NUMBER]
-    const candidate = extractBrandCandidate(itemNumber)
+    const candidates = extractBrandCandidates(itemNumber)
 
-    // No candidate extractable — write Not Found with blank match
-    if (!candidate) {
+    // No candidates extractable at all — write Not Found with blank match
+    if (!candidates.length) {
       try {
         await writeBrandResult(record.id, {
           status: BRAND_WORKER_STATUS.NOT_FOUND,
@@ -88,23 +89,34 @@ async function run({ skipLockCheck } = {}) {
       continue
     }
 
-    // Fuzzy match against BQ Brands
-    const results = fuse.search(candidate)
-    const best = results[0]
-    const score = best ? 1 - (best.score || 0) : 0
+    // Try every candidate — keep the highest-confidence hit.
+    let bestHit = null
+    let bestScore = 0
+    let bestCandidate = null
+    for (const c of candidates) {
+      const results = fuse.search(c)
+      if (!results.length) continue
+      const score = 1 - (results[0].score || 0)
+      if (score > bestScore) {
+        bestScore = score
+        bestHit = results[0].item
+        bestCandidate = c
+      }
+    }
 
-    // No match or confidence too low — write Not Found with the candidate for auditing
-    if (!best || score < CONFIDENCE_THRESHOLD) {
+    // No match above threshold — write Not Found with candidates tried for auditing
+    if (!bestHit || bestScore < CONFIDENCE_THRESHOLD) {
       try {
+        const matchAudit = candidates.join(' | ')
         await writeBrandResult(record.id, {
           status: BRAND_WORKER_STATUS.NOT_FOUND,
-          matchValue: candidate,
+          matchValue: matchAudit,
         })
-        const reason = best
-          ? `low confidence "${best.item.correctSpelling}" (${(score * 100).toFixed(0)}%)`
-          : `no match for "${candidate}"`
+        const reason = bestHit
+          ? `best "${bestHit.correctSpelling}" (${(bestScore * 100).toFixed(0)}%) below threshold`
+          : `no Fuse hits across ${candidates.length} candidate(s)`
         console.log(`  NOT FOUND ${itemNumber} — ${reason}`)
-        logger.log({ itemNumber, outcome: 'Not Found', candidate, reason })
+        logger.log({ itemNumber, outcome: 'Not Found', candidates: matchAudit, reason })
         notFound++
       } catch (err) {
         console.error(`  ERROR ${itemNumber}:`, err.message)
@@ -117,16 +129,16 @@ async function run({ skipLockCheck } = {}) {
     try {
       await writeBrandResult(record.id, {
         status: BRAND_WORKER_STATUS.FOUND,
-        brand: best.item.correctSpelling,
-        matchValue: best.item.correctSpelling,
+        brand: bestHit.correctSpelling,
+        matchValue: bestHit.correctSpelling,
       })
-      console.log(`  FOUND ${itemNumber} → "${best.item.correctSpelling}" (${(score * 100).toFixed(0)}%)`)
+      console.log(`  FOUND ${itemNumber} → "${bestHit.correctSpelling}" (${(bestScore * 100).toFixed(0)}% via "${bestCandidate}")`)
       logger.log({
         itemNumber,
         outcome: 'Found',
-        brand: best.item.correctSpelling,
-        candidate,
-        score: Math.round(score * 100),
+        brand: bestHit.correctSpelling,
+        candidate: bestCandidate,
+        score: Math.round(bestScore * 100),
       })
       found++
     } catch (err) {
