@@ -87,6 +87,10 @@ export function extractBrandCandidate(itemNumber) {
   // If structured item number, brand is first segment
   if (parsed?.brand) return parsed.brand
 
+  // UPC-only item number (with or without condition suffix) —
+  // use the clean UPC as candidate. BQ Brands has UPCs in Title field.
+  if (parsed?.isUPC) return parsed.baseItemNumber
+
   // If item number has spaces (some raw GoFlow names), first word
   if (itemNumber.includes(' ')) {
     return itemNumber.split(' ')[0]

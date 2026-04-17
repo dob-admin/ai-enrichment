@@ -17,6 +17,10 @@ export const FIELDS = {
   UPC_CODE:             'fldztKcxkNyOeUUT6',  // UPC Code
   GLOBAL_ITEM_NUMBER:   'fldzhTGrcoRSXGNny',  // Global Item Number (formula: no condition suffix)
 
+  // Brand worker tracking
+  BRAND_WORKER_STATUS:  'fld7ZPS4wg36qg14D',  // Brand Worker Status (Found/Not Found)
+  BRAND_NAME_MATCH:     'fldvnSBpdKX8YSehA',  // Brand Name Match (matched Correct Spelling on success, candidate on failure)
+
   // Inventory
   AMZ_INVENTORY:        'fld3gWkrnCSu8re6B',  // amz_inventory_count
   BOW_INVENTORY:        'fldmn89jlHbpoXc7O',  // bow_inventory_count
@@ -176,6 +180,12 @@ export const AI_COST_CHECK = {
 export const COST_FIX = {
   INPUTTED: 'Inputted', // VA manually entered cost
   NO_DATA:  'No Data',  // VA confirmed no cost available
+}
+
+// Brand Worker Status values
+export const BRAND_WORKER_STATUS = {
+  FOUND:     'Found',     // candidate matched against BQ Brands
+  NOT_FOUND: 'Not Found', // no match above confidence threshold (or no candidate extractable)
 }
 
 // Shopify category allowed values for footwear

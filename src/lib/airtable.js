@@ -11,13 +11,16 @@ const brandsTable = () => base(process.env.AIRTABLE_BRANDS_TABLE_ID)
 const delay = (ms) => new Promise(r => setTimeout(r, ms))
 const RATE_DELAY = parseInt(process.env.AIRTABLE_RATE_DELAY_MS || '250')
 
-// Fetch records needing brand resolution
-export async function getMissingBrandRecords(limit = 50) {
+// Fetch ALL records needing brand resolution
+// Criteria: Total Inventory > 0, Brand empty, Brand Worker Status empty
+// No maxRecords limit — worker processes the full queue each run
+export async function getMissingBrandRecords() {
   const records = []
   await table().select({
     returnFieldsByFieldId: true,
     filterByFormula: `AND(
-      OR({${FIELDS.BRAND}} = '', {${FIELDS.WEBSITE}} = ''),
+      {${FIELDS.BRAND}} = BLANK(),
+      {${FIELDS.BRAND_WORKER_STATUS}} = BLANK(),
       {${FIELDS.TOTAL_INVENTORY}} > 0
     )`,
     fields: [
@@ -27,7 +30,6 @@ export async function getMissingBrandRecords(limit = 50) {
       FIELDS.CONDITION,
       FIELDS.TOTAL_INVENTORY,
     ],
-    maxRecords: limit,
   }).eachPage((page, next) => {
     records.push(...page)
     next()
@@ -163,12 +165,17 @@ export async function loadAllBrands() {
   return brands
 }
 
-// Write brand to a record (brand resolution worker)
-export async function writeBrand(recordId, brand) {
+// Write brand worker result to a record.
+// On Found: writes Brand (correct spelling), Brand Name Match, Brand Worker Status = Found.
+// On Not Found: writes Brand Name Match (candidate tried, may be null), Brand Worker Status = Not Found.
+export async function writeBrandResult(recordId, { status, brand, matchValue }) {
   await delay(RATE_DELAY)
-  return table().update(recordId, {
-    [FIELDS.BRAND]: brand,
-  })
+  const fields = {
+    [FIELDS.BRAND_WORKER_STATUS]: status,
+  }
+  if (brand) fields[FIELDS.BRAND] = brand
+  if (matchValue !== undefined) fields[FIELDS.BRAND_NAME_MATCH] = matchValue || ''
+  return table().update(recordId, fields)
 }
 
 // Write all enrichment fields in a single PATCH call
