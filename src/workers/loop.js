@@ -1,4 +1,5 @@
 
+
 // src/workers/loop.js
 // ══════════════════════════════════════════════════════════════════════════════
 // DOB AI ENRICHMENT — MONOLITH
@@ -718,6 +719,20 @@ function extractWidthFromText(text) {
   return m ? m[1].toUpperCase() : null
 }
 
+// Last-resort one-size detector for bag/accessory items.
+// Used only after parseSizeString + all source extractors fail. Conservative
+// keyword list — only words that are unambiguous bag/accessory indicators.
+// Osprey bag-line names (Fairview, Farpoint, Daylite, Talon, Poco) are included
+// because in this data the brand exclusively ships bags, and these item numbers
+// carry capacity (e.g., "Fairview 40") instead of sizes — which the R-to-L
+// scanner correctly rejects as a size but leaves nothing to write.
+const ONE_SIZE_KEYWORD_RE = /(?<![A-Za-z])(?:duffel|duffle|tote|backpack|daypack|rucksack|eye\s*shield|eyeshield|gridiron|fairview|farpoint|daylite|talon|poco)(?![A-Za-z])/i
+
+function detectOneSize(text) {
+  if (!text) return null
+  return ONE_SIZE_KEYWORD_RE.test(String(text)) ? 'OS' : null
+}
+
 // Parser size string (e.g., "Size_10_5M" or "10_5M") → { size, width }
 // Supports: numeric (10, 10.5, 10M, 10_5M), letter (S/M/L/XL), one-size (OS),
 // gender-letter (M12, W8, J4), dual-gender (M8W10, M7/W8), UK/US/EU prefix.
@@ -725,14 +740,31 @@ function extractWidthFromText(text) {
 function parseSizeString(sizeStr) {
   if (!sizeStr) return null
   let s = String(sizeStr).trim()
-  // Strip leading "Size_" / "Sz_" markers (single or repeated)
-  s = s.replace(/^(?:size|sz)[_\s:]+/i, '')
+  // Strip leading "Size_" / "Sz_" / "Size:" markers (single or repeated)
+  s = s.replace(/^(?:size|sz):?[_\s:]+/i, '')
+  // Strip leading gender/age qualifier prefixes: Womens, Mens, Junior's, Youth, Kids, Girls, Boys, Children's
+  s = s.replace(/^(?:Women(?:'?s)?|Men(?:'?s)?|Junior(?:'?s)?|Youth|Kid(?:'?s)?|Girl(?:'?s)?|Boy(?:'?s)?|Child(?:ren)?(?:'?s)?)[_\s]+/i, '')
   // Strip trailing UPC-like digit runs (10–14 digits preceded by _ or whitespace)
   s = s.replace(/[_\s]\d{10,14}$/, '')
   if (!s) return null
 
-  // Dual-gender: M8W10, M4_5W6, M7/W8, M10/W12
-  let m = s.match(/^([MW])(\d{1,2}(?:[._]\d)?)[_\s/]*([MW])(\d{1,2}(?:[._]\d)?)/i)
+  // Jeans: 34x36 (waist x inseam) — before numeric so it wins
+  let m = s.match(/^(\d{2})x(\d{2})(?=[_\s/]|$)/i)
+  if (m) {
+    return { size: `${m[1]}x${m[2]}`, width: null }
+  }
+
+  // Combined UK/US: UK8_5_US9, UK_5_US_7, UK 5.5/US 7 — prefer US value (we store US sizes)
+  m = s.match(/^UK[_\s]?(\d{1,2}(?:[._]\d)?)[_\s/]+US[_\s]?(\d{1,2}(?:[._]\d)?)(?:[_\s]?(\d?[MWwDBEN]{1,2}))?(?=[_\s/]|$|\b)/i)
+  if (m) {
+    return {
+      size: m[2].replace('_', '.'),
+      width: m[3] ? m[3].toUpperCase() : null,
+    }
+  }
+
+  // Dual-gender: M8W10, M4_5W6, M7/W8, M10/W12, M/5 W7, M/5_W7, M10/ W12
+  m = s.match(/^([MW])[_\s/]?(\d{1,2}(?:[._]\d)?)[_\s/]*([MW])[_\s/]?(\d{1,2}(?:[._]\d)?)/i)
   if (m) {
     return {
       size: `${m[1].toUpperCase()}${m[2].replace('_', '.')}/${m[3].toUpperCase()}${m[4].replace('_', '.')}`,
@@ -743,19 +775,30 @@ function parseSizeString(sizeStr) {
     }
   }
 
-  // Letter-only: XS, S, M, L, XL, XXL, XXXL, Small, Medium, Large
-  m = s.match(/^(XXS|XS|S|M|L|XL|XXL|XXXL|Small|Medium|Large)\b/i)
+  // Letter-with-separator: L/M, M/L, S/M (hat or combined sizes)
+  m = s.match(/^(XS|S|M|L|XL)[_/\s]+(XS|S|M|L|XL)(?=[_\s/]|$|\b)/i)
   if (m) {
-    return { size: m[1].toUpperCase(), width: null }
+    return { size: `${m[1].toUpperCase()}/${m[2].toUpperCase()}`, width: null }
+  }
+
+  // Letter-only: XS, S, M, L, XL, XXL, XXXL, Small, Medium, Large, MDLG, Powerstep [A-F] or K
+  m = s.match(/^(XXXL|XXL|XL|XXS|XS|Small|Medium|Large|MDLG|S|M|L|A|B|C|D|E|F|K)(?=[_\s/]|$|\b)/i)
+  if (m) {
+    let letter = m[1].toUpperCase()
+    if (letter === 'SMALL') letter = 'S'
+    else if (letter === 'MEDIUM') letter = 'M'
+    else if (letter === 'LARGE') letter = 'L'
+    else if (letter === 'MDLG') letter = 'L'   // MDLG = Medium/Large, normalize to L
+    return { size: letter, width: null }
   }
 
   // One-size: OS, O/S, O_S, OSFM, One Size, OSFA
-  if (/^(O[_/]?S|OSFM|ONE[_\s]?SIZE|OSFA)\b/i.test(s)) {
+  if (/^(O[_/]?S|OSFM|ONE[_\s]?SIZE|OSFA)(?=[_\s/]|$|\b)/i.test(s)) {
     return { size: 'OS', width: null }
   }
 
   // Gender-letter + number: M12, W8, J4, C6, K11, Y5
-  m = s.match(/^([MWCJKY])(\d{1,2}(?:[._]\d)?)\b/i)
+  m = s.match(/^([MWCJKY])(\d{1,2}(?:[._]\d)?)(?=[_\s/]|$|\b)/i)
   if (m) {
     return {
       size: m[2].replace('_', '.'),
@@ -764,8 +807,8 @@ function parseSizeString(sizeStr) {
     }
   }
 
-  // UK/US/EU prefix: UK_6_5, UK8.5, EU36, US_10, US 10M
-  m = s.match(/^(?:UK|US|EU)[_\s]?(\d{1,2}(?:[._]\d)?)[_\s]?([MWwDBE]{1,2})?\b/i)
+  // UK/US/EU prefix: UK_6_5, UK8.5, EU36, US_10, US 10M, EU_40_N, US12W
+  m = s.match(/^(?:UK|US|EU)[_\s]?(\d{1,2}(?:[._]\d)?)[_\s]?(\d?[MWwDBEN]{1,2}|XW|XN|EEE|EEEE)?(?=[_\s/]|$|\b)/i)
   if (m) {
     return {
       size: m[1].replace('_', '.'),
@@ -773,8 +816,8 @@ function parseSizeString(sizeStr) {
     }
   }
 
-  // Numeric with optional half and optional width: 10, 10.5, 10_5, 10M, 10_5M
-  m = s.match(/^(\d{1,2})(?:[._](\d))?\s*([MWwDBE]{1,2})?\b/)
+  // Numeric with optional half and optional (wider) width: 10, 10.5, 10_5, 10M, 10_5M, 11_5_2E, 9M_B
+  m = s.match(/^(\d{1,2})(?:[._](\d))?[_\s]*(\d?[MWwDBEN]{1,2}|XW|XN|EEE|EEEE)?(?=[_\s/]|$|\b)/)
   if (m) {
     const whole = m[1]
     const half  = m[2]
@@ -901,6 +944,23 @@ function extractAttributes(record, sources, parsed, upcMatch) {
   if (!gender) gender = 'Unisex'
   if (!ageRange) ageRange = ageRangeFromGender(gender)
   if (!width) width = 'M'  // spec default
+
+  // ── Step 2.5: Last-resort one-size detection from item text ──────────────
+  // For bags, totes, accessories (eye shield, etc.) where no numeric shoe size
+  // exists. Runs only if all prior sources failed to produce a size. Writes
+  // 'OS' so the record can clear without inventing a wrong shoe size.
+  if (!size && parsed?.baseItemNumber && detectOneSize(parsed.baseItemNumber)) {
+    size = 'OS'
+    width = null
+  }
+  if (!size) {
+    const keepaName = sources.find(s => s.type?.startsWith('Keepa'))?.name
+    const goflowName = sources.find(s => s.type === 'GoFlow')?.name
+    if (detectOneSize(keepaName) || detectOneSize(goflowName)) {
+      size = 'OS'
+      width = null
+    }
+  }
 
   // ── Step 3: If no size found anywhere, park (per user's spec) ─────────────
   if (!size) return { skip: false, noSize: true }

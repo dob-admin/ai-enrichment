@@ -5,6 +5,100 @@ const CONDITION_CODES = ['NMB', 'ULN', 'UVG', 'UGD', 'UAI', 'UAC', 'UDF']
 const CONDITION_REGEX = new RegExp(`_(${CONDITION_CODES.join('|')})$`, 'i')
 const UPC_REGEX = /^\d{8,14}$/
 
+// Size-candidate patterns used by the right-to-left scanner.
+// Split into two so single-letter sizes (S/M/L) require UPPERCASE — this avoids
+// false positives from possessive-apostrophe stripping (e.g. "Champion Men's_UPC"
+// → raw "Champion Men s_UPC" — we must NOT treat trailing "s" as a size).
+const _LETTER_SIZE_WORD = /^(?:XXXL|XXL|XL|XXS|XS|MDLG|Small|Medium|Large)$/i
+const _LETTER_SIZE_CHAR = /^[SML]$/           // no /i flag — uppercase only
+const _matchesLetterSize = tok => _LETTER_SIZE_WORD.test(tok) || _LETTER_SIZE_CHAR.test(tok)
+const _DIGIT_SIZE  = /^\d{1,3}(?:\.\d+)?[WDEB]?$/i
+const _DIGIT_ONLY  = /^\d{1,2}(?:\.\d+)?$/
+const _DUAL_GEN    = /^[MW]\d{1,2}(?:\.\d+)?\/?[MW]\d{1,2}(?:\.\d+)?$/i
+const _GENDER_LTR  = /^[MWCJKY]\d{1,2}(?:\.\d+)?$/i
+const _PREFIX_NUM  = /^(?:US|UK|EU)\d{1,2}(?:\.\d+)?[A-Z]{0,2}$/i
+const _ONE_SIZE    = /^(?:OS|OSFM|OSFA|O\/S)$/i
+const _EMBEDDED_TAIL = /^(.+?)([MWCJKY]\d{1,2})$/i
+
+// Split SKU-like tokens whose tail is a gender-letter size.
+//   "204536-001C11"            → ["204536-001", "C11"]
+//   "11016-410M11"             → ["11016-410", "M11"]
+//   "204536-530J3/206991-530J3" → ["204536-530J3/206991-530", "J3"]
+//   "Crocs"                    → ["Crocs"]        (no digits in prefix)
+//   "C10" / "M11"              → ["C10"] / ["M11"] (prefix empty)
+// Requires the prefix to contain at least one digit AND be length >= 3
+// — this avoids splitting product-name words or already-standalone sizes.
+function expandTailSizes(sparts) {
+  const out = []
+  for (const tok of sparts) {
+    const m = tok.match(_EMBEDDED_TAIL)
+    if (m && /\d/.test(m[1]) && m[1].length >= 3) {
+      out.push(m[1])
+      out.push(m[2])
+    } else {
+      out.push(tok)
+    }
+  }
+  return out
+}
+
+// Right-to-left scan for a size-token position. Returns index into `sparts`
+// or -1 if no candidate found. Order of checks per position matters:
+//   1. Compound O + S (two adjacent tokens)  → return prev idx (so size="O_S")
+//   2. Letter-size (extend through consecutive letter-sizes like L_XL;
+//      if preceded by a digit-only token, combine as "9.5 M" → use digit idx)
+//   3. One-size (OS|OSFM|OSFA|O/S as single token)
+//   4. Dual-gender numeric (M8W10, M10/W12)
+//   5. Gender-letter (C6, J3, M11)
+//   6. US/UK/EU-prefixed (US9, UK11, EU40)
+//   7. Bare digit (1–3 digits, optional .5, optional W/D/E/B)
+//      — rejected if any later token is alpha with length >= 3 (a color/word,
+//        e.g. "Osprey_..._40_NJBlue" — "40" is bag capacity, not a size).
+function scanForSizeToken(sparts) {
+  for (let i = sparts.length - 1; i >= 1; i--) {
+    const tok = sparts[i]
+
+    // 1. Compound O+S (bags one-size written as two tokens: "…_O_S")
+    if (/^S$/i.test(tok) && i >= 1 && /^O$/i.test(sparts[i - 1])) {
+      return i - 1
+    }
+
+    // 2. Letter-size
+    if (_matchesLetterSize(tok)) {
+      // Digit-before-letter combine: "9.5 M" → use digit position so
+      // parseSizeString sees "9.5_M" and captures both size and width.
+      if (i >= 1 && _DIGIT_ONLY.test(sparts[i - 1])) return i - 1
+      // Extend backward through consecutive letter-sizes (L_XL, M/L hat range)
+      let j = i
+      while (j - 1 >= 1 && _matchesLetterSize(sparts[j - 1]) && !_DIGIT_ONLY.test(sparts[j - 1])) {
+        j--
+      }
+      return j
+    }
+
+    // 3. One-size (compound token)
+    if (_ONE_SIZE.test(tok)) return i
+
+    // 4. Dual-gender numeric
+    if (_DUAL_GEN.test(tok)) return i
+
+    // 5. Gender-letter
+    if (_GENDER_LTR.test(tok)) return i
+
+    // 6. Prefix-num (US9, UK11, EU40)
+    if (_PREFIX_NUM.test(tok)) return i
+
+    // 7. Bare digit — reject if followed by alpha(≥3) tokens (color/word context)
+    //    "Osprey_Fairview_40_NJBlue" → "40" rejected because "NJBlue" is 6 alpha chars.
+    if (_DIGIT_SIZE.test(tok)) {
+      const rest = sparts.slice(i + 1)
+      const hasColorLike = rest.some(t => /^[A-Za-z]{3,}$/.test(t))
+      if (!hasColorLike) return i
+    }
+  }
+  return -1
+}
+
 export function parseItemNumber(itemNumber) {
   if (!itemNumber) return null
 
@@ -28,31 +122,41 @@ export function parseItemNumber(itemNumber) {
   let modelNumber = null
   let size = null
 
-  if (!isUPC && baseItemNumber.includes('_')) {
-    const parts = baseItemNumber.split('_')
-    brand = parts[0] || null
+  // Accept underscore OR whitespace as part separator. Use sparts (space+underscore
+  // split) for size-token detection; keep parts (underscore-only) available for
+  // legacy brand/model behavior where relevant.
+  const hasSep = baseItemNumber.includes('_') || /\s/.test(baseItemNumber)
+  if (!isUPC && hasSep) {
+    const parts = baseItemNumber.split('_').filter(Boolean)
+    const rawSparts = baseItemNumber.split(/[_\s]+/).filter(Boolean)
+    // Expand SKU-like tokens whose tail is a gender-letter size (C11, J3, M11, etc.)
+    // e.g. "204536-001C11" → ["204536-001", "C11"]
+    const sparts = expandTailSizes(rawSparts)
 
-    // Find size — prefer the explicit "Size" or "Sz" keyword as its own token.
-    // Only fall back to a bare-numeric token if no keyword is found, and even
-    // then require 1–3 digits (with optional .5 and optional W/D/E/B suffix)
-    // to avoid matching model numbers or UPCs. Scan right-to-left in the
-    // fallback since size appears near the end.
-    let sizeIdx = parts.findIndex(p => /^(size|sz)$/i.test(p))
+    // Brand: first sparts token (handles both "Cole_Haan_…" → "Cole" and
+    // "Osprey 10003685 Fairview…" → "Osprey").
+    brand = sparts[0] || parts[0] || null
+
+    // sizeIdx via explicit Size/Sz keyword (accept optional trailing colon).
+    let sizeIdx = sparts.findIndex(p => /^(?:size|sz):?$/i.test(p))
+    const foundByKeyword = sizeIdx !== -1
+
+    // Fallback: multi-pattern right-to-left scan.
     if (sizeIdx === -1) {
-      for (let i = parts.length - 1; i >= 2; i--) {
-        if (/^\d{1,3}(\.\d+)?[WDEB]?$/i.test(parts[i])) {
-          sizeIdx = i
-          break
-        }
-      }
+      sizeIdx = scanForSizeToken(sparts)
     }
 
-    if (sizeIdx > 1) {
-      // Everything between brand and size is model number
-      modelNumber = parts.slice(1, sizeIdx).join('_')
-      size = parts.slice(sizeIdx).join('_')
-    } else if (parts.length >= 2) {
-      modelNumber = parts.slice(1).join('_')
+    // If the scan (not the keyword) found the size AND it's preceded by a
+    // UK/US/EU prefix token, expand backward so parseSizeString sees the prefix.
+    if (!foundByKeyword && sizeIdx >= 1 && /^(UK|US|EU)$/i.test(sparts[sizeIdx - 1])) {
+      sizeIdx = sizeIdx - 1
+    }
+
+    if (sizeIdx >= 1) {
+      modelNumber = sparts.slice(1, sizeIdx).join('_') || null
+      size = sparts.slice(sizeIdx).join('_')
+    } else if (sparts.length >= 2) {
+      modelNumber = sparts.slice(1).join('_') || null
     }
   }
 
