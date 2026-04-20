@@ -46,7 +46,7 @@ import { buildSystemPrompt, buildUserMessage } from '../prompts/enrichmentPrompt
 // CONSTANTS & CONFIG
 // ══════════════════════════════════════════════════════════════════════════════
 
-const MAX_ATTEMPTS = 5
+const MAX_ATTEMPTS = 3
 const RATE_DELAY = parseInt(process.env.AIRTABLE_RATE_DELAY_MS || '250')
 const MIN_COST_THRESHOLD = parseFloat(process.env.MIN_COST_THRESHOLD || '1.00')
 
@@ -1285,22 +1285,27 @@ async function processRecord(record, loggerInst) {
     return 'not_found'
   }
 
+  // Compute price from sources (or cost fallback) BEFORE Claude runs.
+  // Price is deterministic — no point paying Claude tokens to guess it.
+  // Order: GoFlow Amazon listing → Keepa Amazon current → cost × 1.5 + $7
+  let computedPrice = null
+  const goflowSource = sources.find(s => s.type === 'GoFlow')
+  const keepaSource = sources.find(s => s.type?.startsWith('Keepa'))
+  if (goflowSource?.listingPrice > 0) computedPrice = goflowSource.listingPrice
+  else if (keepaSource?.currentPrice > 0) computedPrice = keepaSource.currentPrice
+  else if (cost > 0) computedPrice = Math.round((cost * 1.5 + 7) * 100) / 100
+
+  if (computedPrice) {
+    await writeFields(record.id, { [FIELDS.PRICE]: computedPrice })
+    console.log(`  → Price pre-set: $${computedPrice}`)
+  }
+
   console.log(`  → Calling Claude (${sources.length} source(s))`)
   const claudeOutput = await callClaude(recordContext, sources)
 
-  // Inject price if Claude didn't find one
-  if (!claudeOutput.price) {
-    const goflowSource = sources.find(s => s.type === 'GoFlow')
-    if (goflowSource?.listingPrice > 0) claudeOutput.price = goflowSource.listingPrice
-    const keepaSource = sources.find(s => s.type?.startsWith('Keepa'))
-    if (!claudeOutput.price && keepaSource?.currentPrice > 0) claudeOutput.price = keepaSource.currentPrice
-    // Final fallback: derive from item cost when no source has a retail price.
-    // Formula: cost × 1.5 + $7 (markup + flat handling buffer)
-    if (!claudeOutput.price && cost > 0) {
-      claudeOutput.price = Math.round((cost * 1.5 + 7) * 100) / 100
-      console.log(`  → Price fallback: $${claudeOutput.price} (cost $${cost} × 1.5 + $7)`)
-    }
-  }
+  // Claude's price output (if any) is overridden by our pre-computed price.
+  // This keeps price deterministic and removes it as a retry trigger.
+  if (computedPrice) claudeOutput.price = computedPrice
 
   const { fields, status, missingFields } = buildClaudeWritePayload(claudeOutput, recordContext)
   await writeFields(record.id, fields)
