@@ -139,11 +139,12 @@ export const NPCN_STORES = [WEBSITE.LTV, WEBSITE.RTV]
 
 // Condition codes and their full text labels (for NPCN RTV title suffix)
 export const CONDITION_LABELS = {
-  NMB: 'New Missing Box',
+  NMB: 'New - Missing Box',
   ULN: 'Used Like New',
   UVG: 'Used Very Good',
   UGD: 'Used Good',
   UAI: 'Used As-Is',
+  UAC: 'Used Acceptable',
   UDF: 'Used - Defective',
 }
 

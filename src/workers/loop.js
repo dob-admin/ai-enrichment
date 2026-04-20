@@ -186,7 +186,9 @@ async function markDone(recordId, loggerCtx) {
   await writeFields(recordId, {
     [FIELDS.LOOP_STATUS]: LOOP_STATUS.DONE,
     [FIELDS.PD_READY_HOLD]: true,
-    [FIELDS.VA_NEEDED]: null,
+    [FIELDS.VA_NEEDED]: '',
+    [FIELDS.AI_STATUS]: AI_STATUS.COMPLETE,
+    [FIELDS.AI_MISSING]: '',
   })
   console.log(`  ✓ DONE — PD Ready Hold set`)
 }
@@ -970,8 +972,12 @@ function buildClaudeWritePayload(claudeOutput, recordContext) {
   }
 
   if (isRTV) {
-    const conditionText = claudeOutput.option3CustomValue ||
-      (parsedItem.conditionCode ? CONDITION_LABELS[parsedItem.conditionCode] : null)
+    // CONDITION_LABELS is authoritative — Claude has been observed misinterpreting codes
+    // (e.g., outputting "Used - No Missing Box" for NMB instead of "New - Missing Box").
+    // Only fall back to Claude's output if we don't have a parsed condition code.
+    const conditionText = (parsedItem.conditionCode && CONDITION_LABELS[parsedItem.conditionCode])
+      || claudeOutput.option3CustomValue
+      || null
     if (conditionText) fields[FIELDS.OPTION_3_CUSTOM] = conditionText
     else missingFields.push('Option 3 Custom Value (used condition)')
   }
@@ -1409,7 +1415,7 @@ async function resetAllParked() {
       fields: {
         [FIELDS.LOOP_STATUS]: null,
         [FIELDS.ENRICHMENT_ATTEMPTS]: 0,
-        [FIELDS.VA_NEEDED]: null,
+        [FIELDS.VA_NEEDED]: '',
       },
     }))
     try {
