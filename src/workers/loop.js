@@ -1,3 +1,4 @@
+
 // src/workers/loop.js
 // ══════════════════════════════════════════════════════════════════════════════
 // DOB AI ENRICHMENT — MONOLITH
@@ -136,6 +137,36 @@ function extractUPCFromString(str) {
   if (!str) return null
   const m = str.match(/(?<![0-9])(\d{12,14})(?![0-9])/)
   return m ? m[1] : null
+}
+
+// Normalize a brand string for comparison: lowercase, strip punctuation, collapse whitespace.
+// "Van's"  → "vans" ; "Cole-Haan, Inc." → "cole haan inc"
+function normalizeBrandForMatch(s) {
+  if (!s) return ''
+  return String(s)
+    .toLowerCase()
+    .replace(/['\u2019]/g, '')        // strip apostrophes first (Van's → vans, not van s)
+    .replace(/[^a-z0-9]+/g, ' ')      // non-alphanumeric → space
+    .trim()
+    .replace(/\s+/g, ' ')
+}
+
+// Returns true if item's brand and Keepa result's brand are compatible, or if
+// we can't make a determination (missing data on either side). Only returns
+// false when we're confident they disagree.
+//
+// Used to reject Keepa lookups that resolve to a different product than the
+// item-number implies — typically caused by repurposed/recycled UPCs.
+function brandsMatch(itemBrand, keepaBrand) {
+  const a = normalizeBrandForMatch(itemBrand)
+  const b = normalizeBrandForMatch(keepaBrand)
+  if (!a || !b) return true                           // can't compare → don't reject
+  if (a === b) return true
+  if (a.includes(b) || b.includes(a)) return true     // "Merrell" vs "Merrell Footwear"
+  const aFirst = a.split(' ')[0]
+  const bFirst = b.split(' ')[0]
+  if (aFirst && bFirst && aFirst === bFirst && aFirst.length >= 3) return true  // "Cole Haan" vs "Cole Haan Inc"
+  return false
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -610,23 +641,70 @@ function ageRangeFromGender(gender) {
 }
 
 // Extract a size-like substring from a free-text string (Keepa/GoFlow name or desc)
-// Returns first plausible size match, or null
+// Returns first plausible size match, or null.
+//
+// Handles:
+//   "Size 10", "Size 9.5", "Size 12W"               → Size keyword
+//   "US 10"                                          → US prefix
+//   "10 M US", "9.5-M US"                            → num + letter-width + US
+//   "6 Medium US", "9.5 Wide US", "10 Extra Wide US" → num + WORD-width + US
+//   "10M"                                            → tight number+M
+//   "..., Gunsmoke, 11", "..., Brindle/Birch, 9.5"   → trailing comma-separated number
+const WIDTH_WORD_TO_LETTER = {
+  'medium': 'M',
+  'narrow': 'N',
+  'wide': 'W',
+  'extra wide': 'EE',
+  'extra narrow': 'B',
+}
+
 function extractSizeFromText(text) {
   if (!text) return null
   const s = String(text)
-  // Patterns like "Size 10", "10 US", "US Size 10M", "10.5 M", "Size 12W", "Size 9.5"
+
+  // Patterns ordered most-specific → most-general. First match wins.
+  // Each entry: { re, widthFromMatch } — widthFromMatch(m) returns width letter or null.
   const patterns = [
-    /\b(?:Size|Sz)[\s:]*([0-9]{1,2}(?:\.[0-9])?)[\s-]*([A-Z]{1,3})?\b/i,
-    /\bUS[\s:]*([0-9]{1,2}(?:\.[0-9])?)\b/i,
-    /\b([0-9]{1,2}(?:\.[0-9])?)[\s-]*(?:M|W|D|B|EE|XW|N|C)\s*US\b/i,
-    /\b([0-9]{1,2}(?:\.[0-9])?)M\b/,
+    // Word-width form: "6 Medium US", "9.5 Extra Wide US"
+    {
+      re: /\b([0-9]{1,2}(?:\.[0-9])?)\s+(Medium|Wide|Narrow|Extra\s+Wide|Extra\s+Narrow)\s+US\b/i,
+      widthFromMatch: (m) => {
+        const key = m[2].toLowerCase().replace(/\s+/g, ' ')
+        return WIDTH_WORD_TO_LETTER[key] || null
+      },
+    },
+    // Explicit "Size" or "Sz" keyword — "Size 10", "Size 12W", "Sz 9.5"
+    {
+      re: /\b(?:Size|Sz)[\s:]*([0-9]{1,2}(?:\.[0-9])?)[\s-]*([A-Z]{1,3})?\b/i,
+      widthFromMatch: (m) => (m[2] && /^[A-Z]{1,3}$/.test(m[2])) ? m[2].toUpperCase() : null,
+    },
+    // "US 10" / "US: 10"
+    {
+      re: /\bUS[\s:]*([0-9]{1,2}(?:\.[0-9])?)\b/i,
+      widthFromMatch: () => null,
+    },
+    // Number + letter-width + US: "10 M US", "9.5-EE US"
+    {
+      re: /\b([0-9]{1,2}(?:\.[0-9])?)[\s-]*(M|W|D|B|EE|XW|N|C)\s*US\b/i,
+      widthFromMatch: (m) => m[2].toUpperCase(),
+    },
+    // Tight number+M: "10M" (common Keepa form)
+    {
+      re: /\b([0-9]{1,2}(?:\.[0-9])?)M\b/,
+      widthFromMatch: () => 'M',
+    },
+    // Trailing comma-separated number: "..., Gunsmoke, 11", "..., Brindle/Birch, 9.5"
+    // Anchored to end-of-string to avoid matching middle-of-string numbers.
+    {
+      re: /,\s*([0-9]{1,2}(?:\.[0-9])?)\s*$/,
+      widthFromMatch: () => null,
+    },
   ]
-  for (const re of patterns) {
+
+  for (const { re, widthFromMatch } of patterns) {
     const m = s.match(re)
     if (m) {
-      const size = m[1]
-      const width = m[2] && /^[A-Z]{1,3}$/.test(m[2]) ? m[2] : null
-      return { size, width }
+      return { size: m[1], width: widthFromMatch(m) }
     }
   }
   return null
@@ -1297,22 +1375,33 @@ async function processRecord(record, loggerInst) {
 
   // Keepa
   const finalUPC = upc || goflowUPC || extractUPCFromString(parsed.raw)
+  // Expected brand from the item — used to reject Keepa mismatches from recycled UPCs.
+  // Priority: resolved Correct Spelling > raw Brand > parser's first-chunk guess.
+  const expectedBrand = airtableData.brandCorrectSpelling || airtableData.brand || parsed.brand
   if (goflowASIN) {
     console.log(`  → Keepa ASIN: ${goflowASIN}`)
     const keepaData = await keepaLookupByASIN(goflowASIN)
     if (keepaData) {
-      sources.push({ type: 'Keepa', ...keepaData })
-      console.log(`  ✓ Keepa: ${keepaData.name || 'unnamed'}`)
+      if (!brandsMatch(expectedBrand, keepaData.brand)) {
+        console.log(`  ✗ Keepa brand mismatch: item="${expectedBrand}" keepa="${keepaData.brand}" — rejecting`)
+      } else {
+        sources.push({ type: 'Keepa', ...keepaData })
+        console.log(`  ✓ Keepa: ${keepaData.name || 'unnamed'}`)
+      }
     }
   } else if (finalUPC) {
     console.log(`  → Keepa UPC: ${finalUPC}`)
     const keepaData = await keepaLookupByUPC(finalUPC)
     if (keepaData) {
-      sources.push({ type: 'Keepa', ...keepaData })
-      if (!f[FIELDS.UPC_CODE] && finalUPC) {
-        await writeFields(record.id, { [FIELDS.UPC_CODE]: finalUPC })
+      if (!brandsMatch(expectedBrand, keepaData.brand)) {
+        console.log(`  ✗ Keepa brand mismatch: item="${expectedBrand}" keepa="${keepaData.brand}" — rejecting`)
+      } else {
+        sources.push({ type: 'Keepa', ...keepaData })
+        if (!f[FIELDS.UPC_CODE] && finalUPC) {
+          await writeFields(record.id, { [FIELDS.UPC_CODE]: finalUPC })
+        }
+        console.log(`  ✓ Keepa: ${keepaData.name || 'unnamed'}`)
       }
-      console.log(`  ✓ Keepa: ${keepaData.name || 'unnamed'}`)
     }
   }
 
@@ -1324,8 +1413,12 @@ async function processRecord(record, loggerInst) {
       console.log(`  → Keepa search: "${searchQuery}"`)
       const keepaData = await keepaSearch(searchQuery)
       if (keepaData) {
-        sources.push({ type: 'Keepa (search)', ...keepaData })
-        console.log(`  ✓ Keepa search: ${keepaData.name || 'unnamed'}`)
+        if (!brandsMatch(expectedBrand, keepaData.brand)) {
+          console.log(`  ✗ Keepa search brand mismatch: item="${expectedBrand}" keepa="${keepaData.brand}" — rejecting`)
+        } else {
+          sources.push({ type: 'Keepa (search)', ...keepaData })
+          console.log(`  ✓ Keepa search: ${keepaData.name || 'unnamed'}`)
+        }
       }
     }
   }
@@ -1354,6 +1447,16 @@ async function processRecord(record, loggerInst) {
   const current = await refetchRecord(record.id)
   if (hasAllRequiredEnrichmentFields(current)) {
     console.log(`  → All required enrichment fields already present — skipping Claude`)
+    // Reconcile Price against current Cost — covers records enriched on a prior
+    // pass before cost was known, or where cost was later updated by recovery.
+    // Without this, stale Price + new Cost would fail validation and park here.
+    const currentCost  = current.fields[FIELDS.ITEM_COST]  || 0
+    const currentPrice = current.fields[FIELDS.PRICE]      || 0
+    const reconciledPrice = applyPriceFloor(currentPrice, currentCost)
+    if (reconciledPrice !== null && reconciledPrice !== currentPrice) {
+      await writeFields(record.id, { [FIELDS.PRICE]: reconciledPrice })
+      console.log(`  → Price reconciled: $${currentPrice} → $${reconciledPrice}`)
+    }
     const valid = await checkValidation(record.id)
     if (valid.both) {
       await markDone(record.id, logCtx)
