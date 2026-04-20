@@ -903,13 +903,9 @@ async function callClaude(recordContext, sources) {
       'Anthropic enrichRecord'
     )
 
-    // Cache verification — confirms prompt caching is engaging on Railway.
+    // Diagnostic: log full usage object on every Claude call to verify cache engagement
     if (response.usage) {
-      const read = response.usage.cache_read_input_tokens || 0
-      const write = response.usage.cache_creation_input_tokens || 0
-      if (read > 0 || write > 0) {
-        console.log(`  [cache] read=${read} write=${write} input=${response.usage.input_tokens}`)
-      }
+      console.log(`  [cache] usage: ${JSON.stringify(response.usage)}`)
     }
 
     const text = response.content
