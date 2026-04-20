@@ -104,6 +104,24 @@ const keepa = axios.create({
 
 const delay = (ms) => new Promise(r => setTimeout(r, ms))
 
+/**
+ * Compute final price honoring the rule: price must never fall below cost.
+ * - If cost is missing/invalid: use price candidate (if valid), else null.
+ * - If price candidate is missing: default to standard markup (cost * 1.5 + $7).
+ * - If price candidate exists but < cost: bump to cost + $7.
+ * - Otherwise: use price candidate as-is.
+ * Returns a number rounded to 2 decimals, or null.
+ */
+function applyPriceFloor(priceCandidate, cost) {
+  const c = Number(cost) || 0
+  const p = Number(priceCandidate) || 0
+
+  if (c <= 0) return p > 0 ? parseFloat(p.toFixed(2)) : null
+  if (p <= 0) return parseFloat((c * 1.5 + 7).toFixed(2))
+  if (p < c)  return parseFloat((c + 7).toFixed(2))
+  return parseFloat(p.toFixed(2))
+}
+
 function truthy(v) {
   if (v === null || v === undefined) return false
   if (typeof v === 'string') return v.trim() !== ''
@@ -623,18 +641,72 @@ function extractWidthFromText(text) {
 }
 
 // Parser size string (e.g., "Size_10_5M" or "10_5M") → { size, width }
+// Supports: numeric (10, 10.5, 10M, 10_5M), letter (S/M/L/XL), one-size (OS),
+// gender-letter (M12, W8, J4), dual-gender (M8W10, M7/W8), UK/US/EU prefix.
+// Returns object with optional isDual/genderLetter flags for routing.
 function parseSizeString(sizeStr) {
   if (!sizeStr) return null
-  // Remove leading "Size_" or "Sz_"
-  const cleaned = sizeStr.replace(/^(size|sz)_/i, '')
-  // Match "10_5M" (10.5 men) or "10M" (10 men) or "10_5" (10.5, no width)
-  const m = cleaned.match(/^([0-9]+)(?:_([0-9]))?([A-Z]{1,3})?$/i)
-  if (!m) return null
-  const whole = m[1]
-  const half = m[2]
-  const width = m[3] ? m[3].toUpperCase() : null
-  const size = half ? `${whole}.${half}` : whole
-  return { size, width }
+  let s = String(sizeStr).trim()
+  // Strip leading "Size_" / "Sz_" markers (single or repeated)
+  s = s.replace(/^(?:size|sz)[_\s:]+/i, '')
+  // Strip trailing UPC-like digit runs (10–14 digits preceded by _ or whitespace)
+  s = s.replace(/[_\s]\d{10,14}$/, '')
+  if (!s) return null
+
+  // Dual-gender: M8W10, M4_5W6, M7/W8, M10/W12
+  let m = s.match(/^([MW])(\d{1,2}(?:[._]\d)?)[_\s/]*([MW])(\d{1,2}(?:[._]\d)?)/i)
+  if (m) {
+    return {
+      size: `${m[1].toUpperCase()}${m[2].replace('_', '.')}/${m[3].toUpperCase()}${m[4].replace('_', '.')}`,
+      width: null,
+      menSize: m[2].replace('_', '.'),
+      womenSize: m[4].replace('_', '.'),
+      isDual: true,
+    }
+  }
+
+  // Letter-only: XS, S, M, L, XL, XXL, XXXL, Small, Medium, Large
+  m = s.match(/^(XXS|XS|S|M|L|XL|XXL|XXXL|Small|Medium|Large)\b/i)
+  if (m) {
+    return { size: m[1].toUpperCase(), width: null }
+  }
+
+  // One-size: OS, O/S, O_S, OSFM, One Size, OSFA
+  if (/^(O[_/]?S|OSFM|ONE[_\s]?SIZE|OSFA)\b/i.test(s)) {
+    return { size: 'OS', width: null }
+  }
+
+  // Gender-letter + number: M12, W8, J4, C6, K11, Y5
+  m = s.match(/^([MWCJKY])(\d{1,2}(?:[._]\d)?)\b/i)
+  if (m) {
+    return {
+      size: m[2].replace('_', '.'),
+      width: null,
+      genderLetter: m[1].toUpperCase(),
+    }
+  }
+
+  // UK/US/EU prefix: UK_6_5, UK8.5, EU36, US_10, US 10M
+  m = s.match(/^(?:UK|US|EU)[_\s]?(\d{1,2}(?:[._]\d)?)[_\s]?([MWwDBE]{1,2})?\b/i)
+  if (m) {
+    return {
+      size: m[1].replace('_', '.'),
+      width: m[2] ? m[2].toUpperCase() : null,
+    }
+  }
+
+  // Numeric with optional half and optional width: 10, 10.5, 10_5, 10M, 10_5M
+  m = s.match(/^(\d{1,2})(?:[._](\d))?\s*([MWwDBE]{1,2})?\b/)
+  if (m) {
+    const whole = m[1]
+    const half  = m[2]
+    return {
+      size: half ? `${whole}.${half}` : whole,
+      width: m[3] ? m[3].toUpperCase() : null,
+    }
+  }
+
+  return null
 }
 
 // Main extraction cascade — for SDO/REBOUND only
@@ -720,11 +792,26 @@ function extractAttributes(record, sources, parsed, upcMatch) {
   }
 
   // Priority 5: parser.js item-number extraction (primary source for structured Rebound items)
+  // `dualSize` holds per-gender sizes when a dual-gender format was parsed;
+  // used by Step 4 below to write SDO_MEN_SIZE and SDO_WOMEN_SIZE separately.
+  let dualSize = null
   if (!size && parsed?.size) {
     const p = parseSizeString(parsed.size)
     if (p) {
-      size = p.size
-      width = width || p.width
+      if (p.isDual) {
+        dualSize = { men: p.menSize, women: p.womenSize }
+        size     = p.menSize   // fallback single value for downstream writers
+        if (!gender) gender = 'Unisex'
+      } else {
+        size  = p.size
+        width = width || p.width
+        // Use gender-letter to inform gender when we don't already have it
+        if (!gender && p.genderLetter) {
+          if (p.genderLetter === 'M') gender = 'Male'
+          else if (p.genderLetter === 'W') gender = 'Female'
+          else if (['J','C','K','Y'].includes(p.genderLetter)) gender = 'Kids'
+        }
+      }
     }
   }
   // Also try to extract gender from raw item number text
@@ -753,18 +840,18 @@ function extractAttributes(record, sources, parsed, upcMatch) {
     sizeFields[FIELDS.SDO_WOMEN_SIZE] = size
     sizeFields[FIELDS.SDO_WOMEN_WIDTH] = width
   } else if (ageRange === 'Adult' && gender === 'Unisex') {
-    sizeFields[FIELDS.SDO_MEN_SIZE] = size
-    sizeFields[FIELDS.SDO_MEN_WIDTH] = width
-    sizeFields[FIELDS.SDO_WOMEN_SIZE] = size
+    sizeFields[FIELDS.SDO_MEN_SIZE]    = dualSize?.men   ?? size
+    sizeFields[FIELDS.SDO_WOMEN_SIZE]  = dualSize?.women ?? size
+    sizeFields[FIELDS.SDO_MEN_WIDTH]   = width
     sizeFields[FIELDS.SDO_WOMEN_WIDTH] = width
   } else if (ageRange === 'Youth' && gender === 'Kids') {
     sizeFields[FIELDS.SDO_YOUTH_SIZE] = size
     sizeFields[FIELDS.SDO_YOUTH_WIDTH] = width
   } else {
     // Odd combination (shouldn't happen after normalization) — default to Unisex Adult
-    sizeFields[FIELDS.SDO_MEN_SIZE] = size
-    sizeFields[FIELDS.SDO_MEN_WIDTH] = width
-    sizeFields[FIELDS.SDO_WOMEN_SIZE] = size
+    sizeFields[FIELDS.SDO_MEN_SIZE]    = dualSize?.men   ?? size
+    sizeFields[FIELDS.SDO_WOMEN_SIZE]  = dualSize?.women ?? size
+    sizeFields[FIELDS.SDO_MEN_WIDTH]   = width
     sizeFields[FIELDS.SDO_WOMEN_WIDTH] = width
   }
 
@@ -838,11 +925,12 @@ function buildUPCMatchPayload(matchRecord, currentRecord, parsed) {
     }
   }
 
-  // Price: if current record has cost, ensure Price = cost * 1.5 (will be written by cost check too)
+  // Price: compute using cost-floor helper. The UPC match path has no
+  // external price source, so pass null and let the helper default to
+  // cost × 1.5 + $7.
   const cost = currentRecord.fields[FIELDS.ITEM_COST]
-  if (cost && cost > 0) {
-    fields[FIELDS.PRICE] = parseFloat((cost * 1.5).toFixed(2))
-  }
+  const uPrice = applyPriceFloor(null, cost)
+  if (uPrice !== null) fields[FIELDS.PRICE] = uPrice
 
   // AI Status
   fields[FIELDS.AI_STATUS] = AI_STATUS.COMPLETE
@@ -1002,11 +1090,10 @@ function buildClaudeWritePayload(claudeOutput, recordContext) {
     missingFields.push('Product Images')
   }
 
-  // Price
-  const price = claudeOutput.price || null
+  // Price — apply cost-floor rule.
   const cost = airtableData.itemCost || null
-  if (price && price > 0) fields[FIELDS.PRICE] = price
-  else if (cost && cost > 0) fields[FIELDS.PRICE] = parseFloat((cost * 1.5).toFixed(2))
+  const finalPrice = applyPriceFloor(claudeOutput.price, cost)
+  if (finalPrice !== null) fields[FIELDS.PRICE] = finalPrice
   else missingFields.push('price')
 
   // Manual condition type fallback
@@ -1093,7 +1180,8 @@ async function processRecord(record, loggerInst) {
   const f = record.fields
   const itemNumber = f[FIELDS.ITEM_NUMBER]
   const website = f[FIELDS.WEBSITE]
-  const attempts = (f[FIELDS.ENRICHMENT_ATTEMPTS] || 0) + 1
+  const rawAttempts = f[FIELDS.ENRICHMENT_ATTEMPTS] || 0
+  const attempts = rawAttempts + 1
 
   console.log(`\n[Loop] ${itemNumber} [${website}] (attempt ${attempts}/${MAX_ATTEMPTS})`)
 
@@ -1115,13 +1203,20 @@ async function processRecord(record, loggerInst) {
   const costFix = f[FIELDS.COST_FIX]
   const costFixVal = costFix?.name || costFix
   if (costFixVal === COST_FIX.NO_DATA) {
-    // Already known unrecoverable
-    if (attempts >= MAX_ATTEMPTS) {
+    // rawAttempts === 0 means a fresh arrival (first run or VA-reset).
+    // An auto-stamped No Data from a previous cycle shouldn't permanently
+    // block a fresh retry — clear it and let cost recovery try again.
+    if (rawAttempts === 0) {
+      console.log(`  → Clearing stale COST_FIX=No Data on fresh run`)
+      await writeFields(record.id, { [FIELDS.COST_FIX]: null })
+      // Fall through to cost recovery below.
+    } else if (attempts >= MAX_ATTEMPTS) {
       await parkForVA(record.id, 'Missing cost — previously marked No Data', logCtx)
       writeLog(loggerInst, logCtx, PATH.COST_NO_DATA)
       return 'parked'
+    } else {
+      return 'skip'
     }
-    return 'skip'
   }
   if (cost <= MIN_COST_THRESHOLD) {
     // Queue for cost-recovery batch
@@ -1288,12 +1383,13 @@ async function processRecord(record, loggerInst) {
   // Compute price from sources (or cost fallback) BEFORE Claude runs.
   // Price is deterministic — no point paying Claude tokens to guess it.
   // Order: GoFlow Amazon listing → Keepa Amazon current → cost × 1.5 + $7
-  let computedPrice = null
+  // In all cases, enforce: price must be >= cost. If not, bump to cost + $7.
+  let sourcePrice = null
   const goflowSource = sources.find(s => s.type === 'GoFlow')
-  const keepaSource = sources.find(s => s.type?.startsWith('Keepa'))
-  if (goflowSource?.listingPrice > 0) computedPrice = goflowSource.listingPrice
-  else if (keepaSource?.currentPrice > 0) computedPrice = keepaSource.currentPrice
-  else if (cost > 0) computedPrice = Math.round((cost * 1.5 + 7) * 100) / 100
+  const keepaSource  = sources.find(s => s.type?.startsWith('Keepa'))
+  if (goflowSource?.listingPrice > 0)     sourcePrice = goflowSource.listingPrice
+  else if (keepaSource?.currentPrice > 0) sourcePrice = keepaSource.currentPrice
+  const computedPrice = applyPriceFloor(sourcePrice, cost)
 
   if (computedPrice) {
     await writeFields(record.id, { [FIELDS.PRICE]: computedPrice })

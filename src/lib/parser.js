@@ -32,12 +32,20 @@ export function parseItemNumber(itemNumber) {
     const parts = baseItemNumber.split('_')
     brand = parts[0] || null
 
-    // Find size — look for parts that match size patterns
-    // e.g. "Size", "Sz", or numeric size values
-    const sizeIdx = parts.findIndex(p =>
-      /^(size|sz)$/i.test(p) ||
-      /^\d+(\.\d+)?[WDE]?$/.test(p)
-    )
+    // Find size — prefer the explicit "Size" or "Sz" keyword as its own token.
+    // Only fall back to a bare-numeric token if no keyword is found, and even
+    // then require 1–3 digits (with optional .5 and optional W/D/E/B suffix)
+    // to avoid matching model numbers or UPCs. Scan right-to-left in the
+    // fallback since size appears near the end.
+    let sizeIdx = parts.findIndex(p => /^(size|sz)$/i.test(p))
+    if (sizeIdx === -1) {
+      for (let i = parts.length - 1; i >= 2; i--) {
+        if (/^\d{1,3}(\.\d+)?[WDEB]?$/i.test(parts[i])) {
+          sizeIdx = i
+          break
+        }
+      }
+    }
 
     if (sizeIdx > 1) {
       // Everything between brand and size is model number
