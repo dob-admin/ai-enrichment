@@ -1294,6 +1294,12 @@ async function processRecord(record, loggerInst) {
     if (goflowSource?.listingPrice > 0) claudeOutput.price = goflowSource.listingPrice
     const keepaSource = sources.find(s => s.type?.startsWith('Keepa'))
     if (!claudeOutput.price && keepaSource?.currentPrice > 0) claudeOutput.price = keepaSource.currentPrice
+    // Final fallback: derive from item cost when no source has a retail price.
+    // Formula: cost × 1.5 + $7 (markup + flat handling buffer)
+    if (!claudeOutput.price && cost > 0) {
+      claudeOutput.price = Math.round((cost * 1.5 + 7) * 100) / 100
+      console.log(`  → Price fallback: $${claudeOutput.price} (cost $${cost} × 1.5 + $7)`)
+    }
   }
 
   const { fields, status, missingFields } = buildClaudeWritePayload(claudeOutput, recordContext)
