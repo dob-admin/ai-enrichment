@@ -1,7 +1,7 @@
 // src/lib/parser.js
 // Parses DOB item numbers into structured components
 
-const CONDITION_CODES = ['NMB', 'ULN', 'UVG', 'UGD', 'UAI', 'UDF']
+const CONDITION_CODES = ['NMB', 'ULN', 'UVG', 'UGD', 'UAI', 'UAC', 'UDF']
 const CONDITION_REGEX = new RegExp(`_(${CONDITION_CODES.join('|')})$`, 'i')
 const UPC_REGEX = /^\d{8,14}$/
 

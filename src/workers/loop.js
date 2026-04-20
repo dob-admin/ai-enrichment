@@ -229,7 +229,7 @@ async function findMatchByUPC(cleanUpc) {
     returnFieldsByFieldId: true,
     filterByFormula: `AND(
       {${FIELDS.VARIANT_BARCODE}} = '${safe}',
-      NOT({${FIELDS.SHOPIFY_PRODUCT_ID}} = BLANK())
+      {${FIELDS.PD_READY}} = 1
     )`,
     fields: MATCH_FIELDS,
     maxRecords: 5,
@@ -892,10 +892,26 @@ async function callClaude(recordContext, sources) {
         model: 'claude-sonnet-4-6',
         max_tokens: 2000,
         messages: [{ role: 'user', content: userMessage }],
-        system: systemPrompt,
+        system: [
+          {
+            type: 'text',
+            text: systemPrompt,
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
       }),
       'Anthropic enrichRecord'
     )
+
+    // Cache verification — confirms prompt caching is engaging on Railway.
+    if (response.usage) {
+      const read = response.usage.cache_read_input_tokens || 0
+      const write = response.usage.cache_creation_input_tokens || 0
+      if (read > 0 || write > 0) {
+        console.log(`  [cache] read=${read} write=${write} input=${response.usage.input_tokens}`)
+      }
+    }
+
     const text = response.content
       .filter(b => b.type === 'text')
       .map(b => b.text)
