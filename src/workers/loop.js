@@ -450,7 +450,7 @@ async function fireCostBatch(loggerInst) {
       if (loggerInst) {
         loggerInst.log({
           itemNumber,
-          outcome: 'CostFound',
+          outcome: PATH.COST_RECOVERY_PENDING,
           enrichmentPath: PATH.COST_RECOVERY_PENDING,
           costFound: cost,
           costSource: 'Inventory Values Report',
@@ -462,7 +462,7 @@ async function fireCostBatch(loggerInst) {
       if (loggerInst) {
         loggerInst.log({
           itemNumber,
-          outcome: 'CostNoData',
+          outcome: PATH.COST_NO_DATA,
           enrichmentPath: PATH.COST_NO_DATA,
         })
       }
@@ -903,9 +903,10 @@ async function callClaude(recordContext, sources) {
       'Anthropic enrichRecord'
     )
 
-    // Diagnostic: log full usage object on every Claude call to verify cache engagement
+    // Cache diagnostic — one compact line per Claude call for future cost verification.
     if (response.usage) {
-      console.log(`  [cache] usage: ${JSON.stringify(response.usage)}`)
+      const u = response.usage
+      console.log(`  [cache] in=${u.input_tokens} out=${u.output_tokens} read=${u.cache_read_input_tokens || 0} write=${u.cache_creation_input_tokens || 0}`)
     }
 
     const text = response.content
@@ -1301,10 +1302,10 @@ async function processRecord(record, loggerInst) {
   logCtx.fieldsWritten = Object.keys(fields).map(k => resolveFieldName(k))
 
   // ── PHASE 9: VALIDATE AND FINALIZE ────────────────────────────────────────
+  writeLog(loggerInst, logCtx, PATH.CLAUDE_FULL)  // always log the Claude call (independent of validation outcome)
   const valid = await checkValidation(record.id)
   if (valid.both) {
     await markDone(record.id, logCtx)
-    writeLog(loggerInst, logCtx, PATH.CLAUDE_FULL)
     return 'done'
   }
 
