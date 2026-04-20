@@ -1,24 +1,17 @@
-# railway.toml
 [build]
-builder = "nixpacks"
+builder = "NIXPACKS"
 
+# ─── worker-loop: continuous enrichment loop ─────────────────────────────────
 [[services]]
 name = "worker-loop"
-startCommand = "npm run loop"
-[services.deploy]
-restartPolicyType = "always"
-restartPolicyMaxRetries = 10
+startCommand = "node src/workers/loop.js"
 
+[services.restartPolicy]
+type = "always"
+
+
+# ─── worker-brand: brand resolution (cron every 20 minutes) ──────────────────
 [[services]]
 name = "worker-brand"
-startCommand = "npm run brand"
-[services.deploy]
-cronSchedule = "3,23,43 * * * *"
-restartPolicyType = "never"
-
-[[services]]
-name = "worker-report"
-startCommand = "npm run report"
-[services.deploy]
-cronSchedule = "0 * * * *"
-restartPolicyType = "never"
+startCommand = "node src/workers/brandResolution.js"
+cronSchedule = "*/20 * * * *"

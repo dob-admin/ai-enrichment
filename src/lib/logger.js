@@ -26,6 +26,7 @@ const LOG_FIELDS = {
   RUN_DURATION_S:     'fldIQMu2ctq9HILqp',
   RUN_TOTAL_PROCESSED:'fldV3dVJWzJtyWvxP',
   RUN_BREAKDOWN:      'fldRH0SNFbpzecbxG',
+  ENRICHMENT_PATH:    'fldTimUy9WuhWPV4o',
 }
 
 export class WorkerLogger {
@@ -110,6 +111,7 @@ export class WorkerLogger {
     if (e.costSource)          fields[LOG_FIELDS.COST_SOURCE]         = e.costSource
     if (e.priceWritten != null)fields[LOG_FIELDS.PRICE_WRITTEN]       = e.priceWritten
     if (e.modelCandidates)     fields[LOG_FIELDS.MODEL_CANDIDATES]    = Array.isArray(e.modelCandidates) ? e.modelCandidates.join(', ') : e.modelCandidates
+    if (e.enrichmentPath)      fields[LOG_FIELDS.ENRICHMENT_PATH]     = e.enrichmentPath
     return fields
   }
 }

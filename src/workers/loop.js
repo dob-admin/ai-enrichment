@@ -1,28 +1,151 @@
 // src/workers/loop.js
-// Continuous enrichment loop — runs forever, processes all in-scope records
-// until both Product Info Valid and Variant Info Valid = YES, then sets PD Ready Hold
-// Parks records as Needs VA after MAX_ATTEMPTS with specific reason
+// ══════════════════════════════════════════════════════════════════════════════
+// DOB AI ENRICHMENT — MONOLITH
+// ══════════════════════════════════════════════════════════════════════════════
+// Continuous enrichment worker. Single file, all responsibilities.
+//
+// Flow per record:
+//   1. Cost check — use existing cost OR queue for Inventory Values report batch
+//   2. UPC resolution — from UPC Code or parse from item number
+//   3. UPC historical match — if same UPC shipped before anywhere, copy enrichment
+//   4. Gender/size extraction cascade (SDO/REBOUND only) — populate SDO_* fields
+//   5. Skip Claude if all required fields already populated
+//   6. Call Claude for enrichment when needed
+//   7. Write payload to Airtable
+//   8. Re-fetch, verify PIV+VIV both YES, set PD Ready Hold; else park or retry
+//
+// Env vars:
+//   AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_ID
+//   ANTHROPIC_API_KEY
+//   GOFLOW_SUBDOMAIN, GOFLOW_API_TOKEN, GOFLOW_BETA_CONTACT
+//   KEEPA_API_KEY
+//   MIN_COST_THRESHOLD (default 1.00)
+//   AIRTABLE_RATE_DELAY_MS (default 250)
+//   DRY_RUN_LIMIT (optional — cap records processed in a single pass, then exit)
+//   RESET_PARKED (optional — set "true" to clear Loop Status + Enrichment Attempts
+//                 on ALL parked records at startup, then continue normally)
+// ══════════════════════════════════════════════════════════════════════════════
 
 import 'dotenv/config'
+import { fileURLToPath } from 'url'
 import Airtable from 'airtable'
-import { FIELDS, WEBSITE, FOOTWEAR_STORES, NPCN_STORES, AI_STATUS, CONDITION_LABELS, LOOP_STATUS } from '../config/fields.js'
-import { lookupByItemNumber as goflowLookup } from '../lib/goflow.js'
-import { lookupByUPC as keepaLookupByUPC, lookupByASIN, searchProduct as keepaSearch } from '../lib/keepa.js'
-import { enrichRecord } from '../lib/claude.js'
-import { buildWritePayload } from '../lib/fieldWriter.js'
+import axios from 'axios'
+import Anthropic from '@anthropic-ai/sdk'
+
+import {
+  FIELDS, WEBSITE, FOOTWEAR_STORES, NPCN_STORES, AI_STATUS, LOOP_STATUS,
+  CONDITION_LABELS, APPROVED_MATERIALS, AI_COST_CHECK, COST_FIX,
+} from '../config/fields.js'
+import { lookupGoogleCategory } from '../config/taxonomy.js'
 import { parseItemNumber, cleanUPC } from '../lib/parser.js'
-import { findMatchesByModel } from '../lib/airtable.js'
+import { withRetry } from '../lib/retry.js'
 import { WorkerLogger } from '../lib/logger.js'
+import { buildSystemPrompt, buildUserMessage } from '../prompts/enrichmentPrompt.js'
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CONSTANTS & CONFIG
+// ══════════════════════════════════════════════════════════════════════════════
 
 const MAX_ATTEMPTS = 5
 const RATE_DELAY = parseInt(process.env.AIRTABLE_RATE_DELAY_MS || '250')
 const MIN_COST_THRESHOLD = parseFloat(process.env.MIN_COST_THRESHOLD || '1.00')
 
-const base = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY }).base(process.env.AIRTABLE_BASE_ID)
-const table = () => base(process.env.AIRTABLE_TABLE_ID)
-const delay = ms => new Promise(r => setTimeout(r, ms))
+const DRY_RUN_LIMIT = process.env.DRY_RUN_LIMIT
+  ? parseInt(process.env.DRY_RUN_LIMIT) : null
+const RESET_PARKED = process.env.RESET_PARKED === 'true'
 
-// ─── Queue fetch ──────────────────────────────────────────────────────────────
+// Cost recovery batching
+const COST_BATCH_SIZE = 500
+const COST_BATCH_TIMEOUT_MS = 5 * 60 * 1000  // 5 min
+const COST_REPORT_POLL_INTERVAL_MS = 5000    // 5s
+
+// AI Logs table
+const AI_LOGS_TABLE_ID = 'tblOLMPJyFRGatA59'
+
+// Enrichment Path values (new singleSelect field on AI Logs table)
+const PATH = {
+  UPC_MATCH:            'upc_match',
+  SKIP_CLAUDE_EXISTING: 'skip_claude_existing',
+  CLAUDE_FULL:          'claude_full',
+  COST_RECOVERY_PENDING:'cost_recovery_pending',
+  COST_NO_DATA:         'cost_no_data',
+  PARKED:               'parked',
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CLIENTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+const airtable = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY })
+  .base(process.env.AIRTABLE_BASE_ID)
+const table = () => airtable(process.env.AIRTABLE_TABLE_ID)
+const logsTable = () => airtable(AI_LOGS_TABLE_ID)
+
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+
+const goflow = axios.create({
+  baseURL: `https://${process.env.GOFLOW_SUBDOMAIN}.api.goflow.com/v1`,
+  headers: {
+    'Authorization': `Bearer ${process.env.GOFLOW_API_TOKEN}`,
+    'X-Beta-Contact': process.env.GOFLOW_BETA_CONTACT,
+    'Content-Type': 'application/json',
+  },
+  timeout: 15000,
+})
+
+const keepa = axios.create({
+  baseURL: 'https://api.keepa.com',
+  timeout: 15000,
+})
+
+// ══════════════════════════════════════════════════════════════════════════════
+// UTILITIES
+// ══════════════════════════════════════════════════════════════════════════════
+
+const delay = (ms) => new Promise(r => setTimeout(r, ms))
+
+function truthy(v) {
+  if (v === null || v === undefined) return false
+  if (typeof v === 'string') return v.trim() !== ''
+  if (typeof v === 'number') return v !== 0
+  if (Array.isArray(v)) return v.length > 0
+  if (typeof v === 'object') return !!v.name || Object.keys(v).length > 0
+  return !!v
+}
+
+// Extract UPC substring from item number (12-14 consecutive digits, not embedded in other digits)
+function extractUPCFromString(str) {
+  if (!str) return null
+  const m = str.match(/(?<![0-9])(\d{12,14})(?![0-9])/)
+  return m ? m[1] : null
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// AIRTABLE: QUEUE FETCH
+// ══════════════════════════════════════════════════════════════════════════════
+
+const QUEUE_FIELDS = [
+  FIELDS.ITEM_NUMBER, FIELDS.BRAND, FIELDS.BRAND_CORRECT_SPELL,
+  FIELDS.CONDITION, FIELDS.CONDITION_TYPE, FIELDS.MANUAL_CONDITION,
+  FIELDS.WEBSITE, FIELDS.PRODUCT_NAME, FIELDS.PURCHASE_NAME,
+  FIELDS.UPC_CODE, FIELDS.GLOBAL_ITEM_NUMBER, FIELDS.TOTAL_INVENTORY,
+  FIELDS.SDO_COLOR, FIELDS.SDO_GENDER, FIELDS.SDO_AGE_RANGE,
+  FIELDS.SDO_MODEL_NAME, FIELDS.SDO_MODEL_NUMBER,
+  FIELDS.SDO_MEN_SIZE, FIELDS.SDO_MEN_WIDTH,
+  FIELDS.SDO_WOMEN_SIZE, FIELDS.SDO_WOMEN_WIDTH,
+  FIELDS.SDO_YOUTH_SIZE, FIELDS.SDO_YOUTH_WIDTH,
+  FIELDS.SDO_RETAIL_PRICE, FIELDS.BRAND_SITE, FIELDS.OTHER_SITE,
+  FIELDS.ITEM_COST, FIELDS.PRICE, FIELDS.AVAILABLE_VALUE_AVG,
+  FIELDS.AI_COST_CHECK, FIELDS.COST_FIX,
+  FIELDS.ENRICHMENT_ATTEMPTS, FIELDS.LOOP_STATUS,
+  FIELDS.AI_STATUS, FIELDS.VARIANT_BARCODE,
+  FIELDS.PRODUCT_INFO_VALID, FIELDS.VARIANT_INFO_VALID,
+  FIELDS.TITLE, FIELDS.DESCRIPTION, FIELDS.SEO_DESCRIPTION,
+  FIELDS.SHOPIFY_CATEGORY, FIELDS.PRODUCT_IMAGES,
+  FIELDS.OPTION_1_VALUE, FIELDS.OPTION_2_CUSTOM, FIELDS.OPTION_3_CUSTOM,
+  FIELDS.MATERIAL,
+]
+
 async function fetchQueue() {
   const records = []
   await table().select({
@@ -31,122 +154,967 @@ async function fetchQueue() {
       {${FIELDS.TOTAL_INVENTORY}} > 0,
       {${FIELDS.PD_READY}} = 0,
       {${FIELDS.PD_READY_HOLD}} = 0,
-      NOT({${FIELDS.WEBSITE}} = 'ignore'),
+      NOT(LOWER({${FIELDS.WEBSITE}}) = 'ignore'),
       NOT({${FIELDS.WEBSITE}} = ''),
       {${FIELDS.SHOPIFY_PRODUCT_ID}} = BLANK(),
       OR({${FIELDS.LOOP_STATUS}} = BLANK(), {${FIELDS.LOOP_STATUS}} = '${LOOP_STATUS.PENDING}')
     )`,
-    fields: [
-      FIELDS.ITEM_NUMBER,
-      FIELDS.BRAND,
-      FIELDS.BRAND_CORRECT_SPELL,
-      FIELDS.CONDITION,
-      FIELDS.CONDITION_TYPE,
-      FIELDS.MANUAL_CONDITION,
-      FIELDS.WEBSITE,
-      FIELDS.PRODUCT_NAME,
-      FIELDS.PURCHASE_NAME,
-      FIELDS.UPC_CODE,
-      FIELDS.GLOBAL_ITEM_NUMBER,
-      FIELDS.TOTAL_INVENTORY,
-      FIELDS.SDO_COLOR,
-      FIELDS.SDO_GENDER,
-      FIELDS.SDO_AGE_RANGE,
-      FIELDS.SDO_MODEL_NAME,
-      FIELDS.SDO_MODEL_NUMBER,
-      FIELDS.SDO_MEN_SIZE,
-      FIELDS.SDO_MEN_WIDTH,
-      FIELDS.SDO_WOMEN_SIZE,
-      FIELDS.SDO_WOMEN_WIDTH,
-      FIELDS.SDO_YOUTH_SIZE,
-      FIELDS.SDO_RETAIL_PRICE,
-      FIELDS.BRAND_SITE,
-      FIELDS.OTHER_SITE,
-      FIELDS.ITEM_COST,
-      FIELDS.ENRICHMENT_ATTEMPTS,
-      FIELDS.LOOP_STATUS,
-      FIELDS.PRODUCT_INFO_VALID,
-      FIELDS.VARIANT_INFO_VALID,
-      FIELDS.AI_COST_CHECK,
-      FIELDS.COST_FIX,
-      FIELDS.VARIANT_BARCODE,
-    ],
+    fields: QUEUE_FIELDS,
   }).eachPage((page, next) => { records.push(...page); next() })
   return records
 }
 
-// ─── UPC extraction from item number string ───────────────────────────────────
-function extractUPCFromString(str) {
-  if (!str) return null
-  const match = str.match(/(?<![0-9])(\d{12,14})(?![0-9])/)
-  return match ? match[1] : null
-}
-
-// ─── Cost resolution ──────────────────────────────────────────────────────────
-function hasCost(fields) {
-  const cost = fields[FIELDS.ITEM_COST] || 0
-  const costFix = fields[FIELDS.COST_FIX]?.name
-  if (costFix === 'No Data') return false
-  return cost > MIN_COST_THRESHOLD
-}
-
-// ─── Write helper ─────────────────────────────────────────────────────────────
 async function writeFields(recordId, fields) {
   const clean = Object.fromEntries(
-    Object.entries(fields).filter(([, v]) => v !== undefined && v !== null)
+    Object.entries(fields).filter(([, v]) => v !== undefined)
   )
   if (!Object.keys(clean).length) return
   await delay(RATE_DELAY)
   return table().update(recordId, clean)
 }
 
-// ─── Park record for VA ───────────────────────────────────────────────────────
-async function parkForVA(recordId, reason) {
+async function parkForVA(recordId, reason, loggerCtx) {
   console.log(`  → Parking for VA: ${reason}`)
   await writeFields(recordId, {
     [FIELDS.LOOP_STATUS]: LOOP_STATUS.NEEDS_VA,
     [FIELDS.VA_NEEDED]: reason,
   })
+  if (loggerCtx) loggerCtx.path = PATH.PARKED
 }
 
-// ─── Mark done ────────────────────────────────────────────────────────────────
-async function markDone(recordId) {
+async function markDone(recordId, loggerCtx) {
   await writeFields(recordId, {
     [FIELDS.LOOP_STATUS]: LOOP_STATUS.DONE,
     [FIELDS.PD_READY_HOLD]: true,
     [FIELDS.VA_NEEDED]: null,
   })
+  console.log(`  ✓ DONE — PD Ready Hold set`)
 }
 
-// ─── Process one record ───────────────────────────────────────────────────────
-async function processRecord(record) {
+async function markCostNoData(recordId) {
+  console.log(`  → Cost unrecoverable — marking as No Data`)
+  await writeFields(recordId, {
+    [FIELDS.LOOP_STATUS]: LOOP_STATUS.NEEDS_VA,
+    [FIELDS.VA_NEEDED]: 'Cost not found after exhausting GoFlow Inventory Values report',
+    [FIELDS.COST_FIX]: COST_FIX.NO_DATA,
+  })
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// AIRTABLE: UPC HISTORICAL MATCH
+// ══════════════════════════════════════════════════════════════════════════════
+// Find a shipped record (Shopify Product ID populated) with the same Variant Barcode.
+// Variant Barcode is the formula-stripped UPC (no _UVG suffix), so we match cleanly
+// across conditions.
+
+const MATCH_FIELDS = [
+  FIELDS.ITEM_NUMBER, FIELDS.WEBSITE,
+  FIELDS.TITLE, FIELDS.DESCRIPTION, FIELDS.SEO_DESCRIPTION,
+  FIELDS.SHOPIFY_CATEGORY, FIELDS.GOOGLE_CATEGORY, FIELDS.MATERIAL,
+  FIELDS.PRODUCT_IMAGES,
+  FIELDS.OPTION_1_VALUE, FIELDS.OPTION_2_CUSTOM,
+  FIELDS.SDO_COLOR, FIELDS.SDO_GENDER, FIELDS.SDO_AGE_RANGE,
+  FIELDS.SDO_MEN_SIZE, FIELDS.SDO_MEN_WIDTH,
+  FIELDS.SDO_WOMEN_SIZE, FIELDS.SDO_WOMEN_WIDTH,
+  FIELDS.SDO_YOUTH_SIZE, FIELDS.SDO_YOUTH_WIDTH,
+]
+
+async function findMatchByUPC(cleanUpc) {
+  if (!cleanUpc) return null
+  const safe = cleanUpc.replace(/'/g, "\\'")
+  const records = []
+  await table().select({
+    returnFieldsByFieldId: true,
+    filterByFormula: `AND(
+      {${FIELDS.VARIANT_BARCODE}} = '${safe}',
+      NOT({${FIELDS.SHOPIFY_PRODUCT_ID}} = BLANK())
+    )`,
+    fields: MATCH_FIELDS,
+    maxRecords: 5,
+    sort: [{ field: FIELDS.ITEM_NUMBER, direction: 'desc' }],
+  }).eachPage((page, next) => { records.push(...page); next() })
+  return records[0] || null
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// GOFLOW: PRODUCT LOOKUP
+// ══════════════════════════════════════════════════════════════════════════════
+
+async function goflowLookup(itemNumber) {
+  if (!itemNumber || !process.env.GOFLOW_API_TOKEN) return null
+  try {
+    const res = await withRetry(
+      () => goflow.get('/products', { params: { 'filters[item_number:eq]': itemNumber } }),
+      `GoFlow /products ${itemNumber}`
+    )
+    const products = res.data?.data || []
+    if (!products.length) return null
+    const product = products[0]
+    const norm = normalizeGoflow(product)
+
+    // Also fetch listings for ASIN + price
+    try {
+      const listingsRes = await withRetry(
+        () => goflow.get('/listings', { params: { 'filters[product.id:eq]': product.id } }),
+        `GoFlow /listings ${product.id}`
+      )
+      const listings = listingsRes.data?.data || []
+      const amazon = listings.find(l => l.store?.channel === 'amazon_marketplace_usa')
+      if (amazon?.store_page_url) {
+        const asinMatch = amazon.store_page_url.match(/\/dp\/([A-Z0-9]{10})/)
+        if (asinMatch) {
+          norm.asin = asinMatch[1]
+          norm.storePageUrl = amazon.store_page_url
+        }
+      }
+      const priced = listings.find(l => l.price?.amount > 0)
+      if (priced) norm.listingPrice = priced.price.amount
+    } catch (e) {
+      console.log(`  - GoFlow listings lookup failed: ${e.message}`)
+    }
+    return norm
+  } catch (err) {
+    if (err.response?.status === 404) return null
+    console.error(`  GoFlow lookup failed for ${itemNumber}:`, err.message)
+    return null
+  }
+}
+
+function normalizeGoflow(product) {
+  if (!product) return null
+  const details = product.details || {}
+  const identifiers = product.identifiers || []
+  const rawUpc = identifiers.find(i => i.type?.toUpperCase() === 'UPC')?.value || null
+  const upc = rawUpc ? rawUpc.split('_')[0] : null
+  const ean = identifiers.find(i => i.type?.toUpperCase() === 'EAN')?.value || null
+  const mpn = identifiers.find(i => i.type?.toUpperCase() === 'MPN')?.value || null
+  const asin = identifiers.find(i => i.type?.toUpperCase() === 'ASIN')?.value || null
+  return {
+    name: details.name || details.purchase_name || null,
+    brand: details.brand || details.manufacturer || null,
+    description: details.description || null,
+    category: details.category || null,
+    condition: details.condition || null,
+    imageUrls: [],
+    upc, ean, mpn, asin,
+    goflowId: product.id || null,
+    itemNumber: product.item_number || null,
+    raw: {
+      name: details.name,
+      purchase_name: details.purchase_name,
+      brand: details.brand,
+      manufacturer: details.manufacturer,
+      description: details.description,
+      category: details.category,
+      condition: details.condition,
+    },
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// GOFLOW: INVENTORY VALUES REPORT (COST RECOVERY)
+// ══════════════════════════════════════════════════════════════════════════════
+// Submits an async report for a batch of item_numbers, polls until done,
+// fetches the file, and returns { itemNumber: avgCost } map.
+//
+// Rate limit: 6 reports/hour. We respect this by batching.
+
+async function submitInventoryValuesReport(itemNumbers) {
+  const body = {
+    columns: ['product_item_number', 'inventory_value_average', 'available_value_average', 'inventory'],
+    filters: {
+      product_item_number: { values: itemNumbers, operator: 'in' },
+    },
+    format: 'json',
+    limit: 1000000,
+  }
+  const res = await withRetry(
+    () => goflow.post('/reports/inventory/values', body),
+    `GoFlow reports/inventory/values (${itemNumbers.length} items)`
+  )
+  return res.data.id  // report id
+}
+
+async function pollReport(reportId, maxWaitMs = 180000) {
+  const deadline = Date.now() + maxWaitMs
+  while (Date.now() < deadline) {
+    const res = await withRetry(
+      () => goflow.get(`/reports/${reportId}`),
+      `GoFlow reports/${reportId}`
+    )
+    if (res.data.status === 'completed') return res.data
+    if (res.data.status === 'failed') {
+      throw new Error(`Report ${reportId} failed: ${res.data.error || 'unknown'}`)
+    }
+    await delay(COST_REPORT_POLL_INTERVAL_MS)
+  }
+  throw new Error(`Report ${reportId} did not complete within ${maxWaitMs}ms`)
+}
+
+async function fetchReportFile(fileUrl) {
+  // Note: the file URL is already authenticated with bearer, use same axios
+  const res = await withRetry(
+    () => axios.get(fileUrl, {
+      headers: {
+        'Authorization': `Bearer ${process.env.GOFLOW_API_TOKEN}`,
+        'X-Beta-Contact': process.env.GOFLOW_BETA_CONTACT,
+      },
+      timeout: 60000,
+    }),
+    `GoFlow report file`
+  )
+  return res.data  // array of row objects
+}
+
+// ═══ Cost-recovery pending-list state (module-scoped) ════════════════════════
+// Each entry: { recordId, itemNumber }
+let costPending = []
+let costLastFireAt = 0
+
+function addToCostPending(recordId, itemNumber) {
+  costPending.push({ recordId, itemNumber })
+}
+
+function shouldFireCostBatch() {
+  if (costPending.length >= COST_BATCH_SIZE) return true
+  if (costPending.length >= 1 && (Date.now() - costLastFireAt) >= COST_BATCH_TIMEOUT_MS) return true
+  return false
+}
+
+async function fireCostBatch(loggerInst) {
+  if (!costPending.length) return
+  const batch = costPending.slice(0, COST_BATCH_SIZE)
+  costPending = costPending.slice(COST_BATCH_SIZE)
+  costLastFireAt = Date.now()
+
+  const itemNumbers = batch.map(b => b.itemNumber)
+  console.log(`\n[Cost Batch] Submitting ${itemNumbers.length} items to Inventory Values report`)
+  let reportId
+  try {
+    reportId = await submitInventoryValuesReport(itemNumbers)
+    console.log(`[Cost Batch] Report ${reportId} submitted — polling`)
+  } catch (err) {
+    console.error(`[Cost Batch] Submit failed: ${err.message}`)
+    // Put records back on pending so they retry next batch (don't lose them)
+    // Keep costLastFireAt = Date.now() (set above) so we wait 5 min before retry — avoids tight loop
+    costPending = [...batch, ...costPending]
+    return
+  }
+
+  let report
+  try {
+    report = await pollReport(reportId)
+  } catch (err) {
+    console.error(`[Cost Batch] Poll failed: ${err.message}`)
+    costPending = [...batch, ...costPending]
+    return
+  }
+
+  let rows
+  try {
+    rows = await fetchReportFile(report.completed.file_url)
+  } catch (err) {
+    console.error(`[Cost Batch] Fetch file failed: ${err.message}`)
+    costPending = [...batch, ...costPending]
+    return
+  }
+
+  console.log(`[Cost Batch] Report ${reportId} returned ${rows.length} rows`)
+
+  // Build map: itemNumber → best avg cost
+  // Each item_number may appear in multiple warehouses; take the max non-zero avg
+  const costMap = {}
+  for (const row of rows) {
+    const item = row.product_item_number
+    const avg = row.available_value_average || row.inventory_value_average || 0
+    if (avg > MIN_COST_THRESHOLD && (!costMap[item] || avg > costMap[item])) {
+      costMap[item] = avg
+    }
+  }
+
+  // Apply to each pending record
+  let found = 0
+  let notFound = 0
+  for (const { recordId, itemNumber } of batch) {
+    const cost = costMap[itemNumber]
+    if (cost && cost > MIN_COST_THRESHOLD) {
+      await writeFields(recordId, {
+        [FIELDS.ITEM_COST]: cost,
+        [FIELDS.AI_COST_CHECK]: AI_COST_CHECK.FOUND,
+        [FIELDS.COST_FIX]: COST_FIX.INPUTTED,
+      })
+      console.log(`  ✓ Cost found for ${itemNumber}: $${cost.toFixed(2)}`)
+      found++
+      if (loggerInst) {
+        loggerInst.log({
+          itemNumber,
+          outcome: 'CostFound',
+          enrichmentPath: PATH.COST_RECOVERY_PENDING,
+          costFound: cost,
+          costSource: 'Inventory Values Report',
+        })
+      }
+    } else {
+      await markCostNoData(recordId)
+      notFound++
+      if (loggerInst) {
+        loggerInst.log({
+          itemNumber,
+          outcome: 'CostNoData',
+          enrichmentPath: PATH.COST_NO_DATA,
+        })
+      }
+    }
+  }
+  console.log(`[Cost Batch] Applied: ${found} found, ${notFound} no-data`)
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// KEEPA: PRODUCT LOOKUP
+// ══════════════════════════════════════════════════════════════════════════════
+
+const keepaKey = () => process.env.KEEPA_API_KEY
+
+async function keepaLookupByUPC(upc) {
+  if (!upc || !keepaKey()) return null
+  return keepaProductLookup({ code: upc })
+}
+
+async function keepaLookupByASIN(asin) {
+  if (!asin || !keepaKey()) return null
+  return keepaProductLookup({ asin })
+}
+
+async function keepaSearch(query) {
+  if (!query || !keepaKey()) return null
+  const clean = query
+    .replace(/_/g, ' ')
+    .replace(/[^a-zA-Z0-9 .-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 100)
+  if (!clean || clean.length < 5) return null
+  try {
+    const r = await withRetry(
+      () => keepa.get('/search', { params: { key: keepaKey(), domain: 1, type: 1, term: clean } }),
+      `Keepa /search "${clean}"`
+    )
+    const asins = r.data?.asinList
+    if (!asins?.length) return null
+    return await keepaLookupByASIN(asins[0])
+  } catch (err) {
+    if (err.response?.status === 500) {
+      console.log(`  - Keepa search: no result (bad query)`)
+      return null
+    }
+    console.error(`  Keepa search failed for "${clean}":`, err.message)
+    return null
+  }
+}
+
+async function keepaProductLookup(params) {
+  try {
+    const r = await withRetry(
+      () => keepa.get('/product', { params: { key: keepaKey(), domain: 1, ...params } }),
+      `Keepa /product`
+    )
+    const products = r.data?.products
+    if (!products?.length) return null
+    return normalizeKeepa(products[0])
+  } catch (err) {
+    console.error(`  Keepa lookup failed:`, err.message)
+    return null
+  }
+}
+
+function normalizeKeepa(product) {
+  if (!product) return null
+  const imageUrls = (product.imagesCSV || '').split(',').filter(Boolean)
+    .map(id => `https://images-na.ssl-images-amazon.com/images/I/${id}`)
+  const features = product.features || []
+  return {
+    name: product.title || null,
+    brand: product.brand || null,
+    description: [product.description, features.join(' ')].filter(Boolean).join('\n\n') || null,
+    features,
+    category: product.categoryTree?.[product.categoryTree.length - 1]?.name || null,
+    imageUrls,
+    upc: product.upcList?.[0] || null,
+    asin: product.asin || null,
+    color: product.color || null,
+    size: product.size || null,
+    model: product.model || null,
+    manufacturer: product.manufacturer || null,
+    currentPrice: (product.stats?.current?.[0] > 0)
+      ? product.stats.current[0] / 100 : null,
+    raw: {
+      title: product.title, brand: product.brand, features,
+      description: product.description, color: product.color,
+      size: product.size, model: product.model,
+    },
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ATTRIBUTE EXTRACTION CASCADE (SDO/REBOUND ONLY)
+// ══════════════════════════════════════════════════════════════════════════════
+// Derives gender, age range, and size fields from available sources.
+//
+// Vocabulary:
+//   Gender: Male | Female | Unisex | Kids
+//   Age Range: Adult | Youth
+//
+// Write rules (per user's spec):
+//   Adult + Male   → SDO_Men_Size + SDO_Men_Width
+//   Adult + Female → SDO_Women_Size + SDO_Women_Width
+//   Adult + Unisex → BOTH Men and Women fields (same size value)
+//   Youth + Kids   → SDO_Youth_Size + SDO_Youth_Width
+//   Width defaults to "M" when not specified
+
+// Normalize any gender-like string to canonical {Male, Female, Unisex, Kids}
+function normalizeGender(raw) {
+  if (!raw) return null
+  const s = String(raw).toLowerCase().trim()
+  if (/\b(youth|junior|kid|kids|child|children|toddler|infant|baby|boy|girl)\b/.test(s)) return 'Kids'
+  if (/\b(women|woman|womens|female|ladies|lady)\b/.test(s)) return 'Female'
+  if (/\b(men|mens|man|male)\b/.test(s)) return 'Male'
+  if (/\bunisex\b/.test(s)) return 'Unisex'
+  return null
+}
+
+// Derive age range from gender
+function ageRangeFromGender(gender) {
+  if (gender === 'Kids') return 'Youth'
+  if (gender === 'Male' || gender === 'Female' || gender === 'Unisex') return 'Adult'
+  return null
+}
+
+// Extract a size-like substring from a free-text string (Keepa/GoFlow name or desc)
+// Returns first plausible size match, or null
+function extractSizeFromText(text) {
+  if (!text) return null
+  const s = String(text)
+  // Patterns like "Size 10", "10 US", "US Size 10M", "10.5 M", "Size 12W", "Size 9.5"
+  const patterns = [
+    /\b(?:Size|Sz)[\s:]*([0-9]{1,2}(?:\.[0-9])?)[\s-]*([A-Z]{1,3})?\b/i,
+    /\bUS[\s:]*([0-9]{1,2}(?:\.[0-9])?)\b/i,
+    /\b([0-9]{1,2}(?:\.[0-9])?)[\s-]*(?:M|W|D|B|EE|XW|N|C)\s*US\b/i,
+    /\b([0-9]{1,2}(?:\.[0-9])?)M\b/,
+  ]
+  for (const re of patterns) {
+    const m = s.match(re)
+    if (m) {
+      const size = m[1]
+      const width = m[2] && /^[A-Z]{1,3}$/.test(m[2]) ? m[2] : null
+      return { size, width }
+    }
+  }
+  return null
+}
+
+// Extract width-only from free text (e.g., "10 EE" → EE)
+function extractWidthFromText(text) {
+  if (!text) return null
+  const s = String(text)
+  const m = s.match(/\b(?:[0-9]+(?:\.[0-9])?)\s*(M|W|D|B|EE|N|C|XW)\b/i)
+  return m ? m[1].toUpperCase() : null
+}
+
+// Parser size string (e.g., "Size_10_5M" or "10_5M") → { size, width }
+function parseSizeString(sizeStr) {
+  if (!sizeStr) return null
+  // Remove leading "Size_" or "Sz_"
+  const cleaned = sizeStr.replace(/^(size|sz)_/i, '')
+  // Match "10_5M" (10.5 men) or "10M" (10 men) or "10_5" (10.5, no width)
+  const m = cleaned.match(/^([0-9]+)(?:_([0-9]))?([A-Z]{1,3})?$/i)
+  if (!m) return null
+  const whole = m[1]
+  const half = m[2]
+  const width = m[3] ? m[3].toUpperCase() : null
+  const size = half ? `${whole}.${half}` : whole
+  return { size, width }
+}
+
+// Main extraction cascade — for SDO/REBOUND only
+// Returns { gender, ageRange, sizeFields: {fieldId: value, ...} } or { skip: true } if not footwear
+function extractAttributes(record, sources, parsed, upcMatch) {
+  const website = record.fields[FIELDS.WEBSITE]
+  if (!FOOTWEAR_STORES.includes(website)) return { skip: true }
+
+  const f = record.fields
+
+  // ── Step 1: Gather candidates from every source ───────────────────────────
+  let gender = null
+  let ageRange = null
+  let size = null
+  let width = null
+
+  // Priority 1: existing SDO fields on this record (preserve anything already there)
+  if (truthy(f[FIELDS.SDO_GENDER])) {
+    gender = normalizeGender(f[FIELDS.SDO_GENDER])
+  }
+  if (!gender && truthy(f[FIELDS.SDO_AGE_RANGE])) {
+    const ar = String(f[FIELDS.SDO_AGE_RANGE]).toLowerCase()
+    if (/youth|kid/.test(ar)) gender = 'Kids'
+  }
+  if (truthy(f[FIELDS.SDO_AGE_RANGE])) {
+    ageRange = normalizeAgeRange(f[FIELDS.SDO_AGE_RANGE])
+  }
+
+  // Priority 2: UPC historical match (already copied to record, but use explicitly)
+  if (upcMatch) {
+    const m = upcMatch.fields
+    if (!gender && truthy(m[FIELDS.SDO_GENDER])) gender = normalizeGender(m[FIELDS.SDO_GENDER])
+    if (!ageRange && truthy(m[FIELDS.SDO_AGE_RANGE])) ageRange = normalizeAgeRange(m[FIELDS.SDO_AGE_RANGE])
+    // Pick size from whichever match field is populated
+    if (truthy(m[FIELDS.SDO_MEN_SIZE])) size = size || m[FIELDS.SDO_MEN_SIZE]
+    if (truthy(m[FIELDS.SDO_WOMEN_SIZE])) size = size || m[FIELDS.SDO_WOMEN_SIZE]
+    if (truthy(m[FIELDS.SDO_YOUTH_SIZE])) size = size || m[FIELDS.SDO_YOUTH_SIZE]
+    if (truthy(m[FIELDS.SDO_MEN_WIDTH])) width = width || m[FIELDS.SDO_MEN_WIDTH]
+    if (truthy(m[FIELDS.SDO_WOMEN_WIDTH])) width = width || m[FIELDS.SDO_WOMEN_WIDTH]
+    if (truthy(m[FIELDS.SDO_YOUTH_WIDTH])) width = width || m[FIELDS.SDO_YOUTH_WIDTH]
+  }
+
+  // Priority 3: Keepa structured fields + name regex
+  const keepaSource = sources.find(s => s.type?.startsWith('Keepa'))
+  if (keepaSource) {
+    if (!gender) {
+      gender = normalizeGender(keepaSource.name) ||
+               normalizeGender(keepaSource.description) ||
+               normalizeGender(keepaSource.features?.join(' '))
+    }
+    if (!size && keepaSource.size) {
+      // Keepa's size field is unstructured (e.g., "10 M US" or "Size 10")
+      const parsed = extractSizeFromText(keepaSource.size)
+      if (parsed) {
+        size = size || parsed.size
+        width = width || parsed.width
+      }
+    }
+    if (!size) {
+      const parsed = extractSizeFromText(keepaSource.name)
+      if (parsed) {
+        size = size || parsed.size
+        width = width || parsed.width
+      }
+    }
+  }
+
+  // Priority 4: GoFlow name regex
+  const goflowSource = sources.find(s => s.type === 'GoFlow')
+  if (goflowSource) {
+    if (!gender) {
+      gender = normalizeGender(goflowSource.name) ||
+               normalizeGender(goflowSource.description)
+    }
+    if (!size) {
+      const parsed = extractSizeFromText(goflowSource.name) ||
+                     extractSizeFromText(goflowSource.description)
+      if (parsed) {
+        size = size || parsed.size
+        width = width || parsed.width
+      }
+    }
+  }
+
+  // Priority 5: parser.js item-number extraction (primary source for structured Rebound items)
+  if (!size && parsed?.size) {
+    const p = parseSizeString(parsed.size)
+    if (p) {
+      size = p.size
+      width = width || p.width
+    }
+  }
+  // Also try to extract gender from raw item number text
+  if (!gender && parsed?.raw) {
+    gender = normalizeGender(parsed.raw)
+  }
+
+  // ── Step 2: Fallbacks ─────────────────────────────────────────────────────
+  if (!gender) gender = 'Unisex'
+  if (!ageRange) ageRange = ageRangeFromGender(gender)
+  if (!width) width = 'M'  // spec default
+
+  // ── Step 3: If no size found anywhere, park (per user's spec) ─────────────
+  if (!size) return { skip: false, noSize: true }
+
+  // ── Step 4: Build field writes per gender+age combination ─────────────────
+  const sizeFields = {
+    [FIELDS.SDO_GENDER]: gender,
+    [FIELDS.SDO_AGE_RANGE]: ageRange,
+  }
+
+  if (ageRange === 'Adult' && gender === 'Male') {
+    sizeFields[FIELDS.SDO_MEN_SIZE] = size
+    sizeFields[FIELDS.SDO_MEN_WIDTH] = width
+  } else if (ageRange === 'Adult' && gender === 'Female') {
+    sizeFields[FIELDS.SDO_WOMEN_SIZE] = size
+    sizeFields[FIELDS.SDO_WOMEN_WIDTH] = width
+  } else if (ageRange === 'Adult' && gender === 'Unisex') {
+    sizeFields[FIELDS.SDO_MEN_SIZE] = size
+    sizeFields[FIELDS.SDO_MEN_WIDTH] = width
+    sizeFields[FIELDS.SDO_WOMEN_SIZE] = size
+    sizeFields[FIELDS.SDO_WOMEN_WIDTH] = width
+  } else if (ageRange === 'Youth' && gender === 'Kids') {
+    sizeFields[FIELDS.SDO_YOUTH_SIZE] = size
+    sizeFields[FIELDS.SDO_YOUTH_WIDTH] = width
+  } else {
+    // Odd combination (shouldn't happen after normalization) — default to Unisex Adult
+    sizeFields[FIELDS.SDO_MEN_SIZE] = size
+    sizeFields[FIELDS.SDO_MEN_WIDTH] = width
+    sizeFields[FIELDS.SDO_WOMEN_SIZE] = size
+    sizeFields[FIELDS.SDO_WOMEN_WIDTH] = width
+  }
+
+  return { skip: false, gender, ageRange, size, width, sizeFields }
+}
+
+function normalizeAgeRange(raw) {
+  if (!raw) return null
+  const s = String(raw).toLowerCase().trim()
+  if (/youth|kid|infant|toddler|baby|child|junior/.test(s)) return 'Youth'
+  return 'Adult'  // Adult, Adullt, Adults, Aduly, etc.
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// UPC MATCH: APPLY MATCHED RECORD'S FIELDS TO CURRENT RECORD
+// ══════════════════════════════════════════════════════════════════════════════
+// Copies enrichment data from a shipped record with same UPC.
+// Per user's spec: copy everything EXCEPT Option 3 (condition is current-record-specific).
+// For RTV, Option 3 is re-derived from current record's condition code.
+
+function buildUPCMatchPayload(matchRecord, currentRecord, parsed) {
+  const m = matchRecord.fields
+  const website = currentRecord.fields[FIELDS.WEBSITE]
+  const isFootwear = FOOTWEAR_STORES.includes(website)
+  const isRTV = website === WEBSITE.RTV
+
+  const fields = {}
+
+  // Core enrichment — copy from match
+  if (truthy(m[FIELDS.TITLE])) fields[FIELDS.TITLE] = m[FIELDS.TITLE]
+  if (truthy(m[FIELDS.DESCRIPTION])) fields[FIELDS.DESCRIPTION] = m[FIELDS.DESCRIPTION]
+  if (truthy(m[FIELDS.SEO_DESCRIPTION])) fields[FIELDS.SEO_DESCRIPTION] = m[FIELDS.SEO_DESCRIPTION]
+  if (truthy(m[FIELDS.SHOPIFY_CATEGORY])) fields[FIELDS.SHOPIFY_CATEGORY] = m[FIELDS.SHOPIFY_CATEGORY]
+  if (truthy(m[FIELDS.GOOGLE_CATEGORY])) fields[FIELDS.GOOGLE_CATEGORY] = m[FIELDS.GOOGLE_CATEGORY]
+  if (truthy(m[FIELDS.MATERIAL])) fields[FIELDS.MATERIAL] = m[FIELDS.MATERIAL]
+
+  // Images
+  if (m[FIELDS.PRODUCT_IMAGES]?.length) {
+    fields[FIELDS.PRODUCT_IMAGES] = m[FIELDS.PRODUCT_IMAGES].map(img => ({ url: img.url }))
+    fields[FIELDS.VARIANT_IMAGE_INDEX] = 1
+  }
+
+  // Option 1 Value (colorway / color)
+  if (truthy(m[FIELDS.OPTION_1_VALUE])) {
+    fields[FIELDS.OPTION_1_VALUE] = m[FIELDS.OPTION_1_VALUE]
+    if (isFootwear) fields[FIELDS.SDO_COLOR] = m[FIELDS.OPTION_1_VALUE]
+  }
+
+  // Option 2 Custom (NPCN only — size)
+  if (NPCN_STORES.includes(website) && truthy(m[FIELDS.OPTION_2_CUSTOM])) {
+    fields[FIELDS.OPTION_2_CUSTOM] = m[FIELDS.OPTION_2_CUSTOM]
+  }
+
+  // SDO_* size fields (footwear only)
+  if (isFootwear) {
+    if (truthy(m[FIELDS.SDO_GENDER])) fields[FIELDS.SDO_GENDER] = normalizeGender(m[FIELDS.SDO_GENDER]) || m[FIELDS.SDO_GENDER]
+    if (truthy(m[FIELDS.SDO_AGE_RANGE])) fields[FIELDS.SDO_AGE_RANGE] = normalizeAgeRange(m[FIELDS.SDO_AGE_RANGE])
+    if (truthy(m[FIELDS.SDO_MEN_SIZE])) fields[FIELDS.SDO_MEN_SIZE] = m[FIELDS.SDO_MEN_SIZE]
+    if (truthy(m[FIELDS.SDO_MEN_WIDTH])) fields[FIELDS.SDO_MEN_WIDTH] = m[FIELDS.SDO_MEN_WIDTH]
+    if (truthy(m[FIELDS.SDO_WOMEN_SIZE])) fields[FIELDS.SDO_WOMEN_SIZE] = m[FIELDS.SDO_WOMEN_SIZE]
+    if (truthy(m[FIELDS.SDO_WOMEN_WIDTH])) fields[FIELDS.SDO_WOMEN_WIDTH] = m[FIELDS.SDO_WOMEN_WIDTH]
+    if (truthy(m[FIELDS.SDO_YOUTH_SIZE])) fields[FIELDS.SDO_YOUTH_SIZE] = m[FIELDS.SDO_YOUTH_SIZE]
+    if (truthy(m[FIELDS.SDO_YOUTH_WIDTH])) fields[FIELDS.SDO_YOUTH_WIDTH] = m[FIELDS.SDO_YOUTH_WIDTH]
+  }
+
+  // Option 3 Custom — RTV only, derive from CURRENT record's condition (never copy from match)
+  if (isRTV) {
+    const code = currentRecord.fields[FIELDS.CONDITION_TYPE] || parsed?.conditionCode
+    if (code && CONDITION_LABELS[code]) {
+      fields[FIELDS.OPTION_3_CUSTOM] = CONDITION_LABELS[code]
+    }
+  }
+
+  // Price: if current record has cost, ensure Price = cost * 1.5 (will be written by cost check too)
+  const cost = currentRecord.fields[FIELDS.ITEM_COST]
+  if (cost && cost > 0) {
+    fields[FIELDS.PRICE] = parseFloat((cost * 1.5).toFixed(2))
+  }
+
+  // AI Status
+  fields[FIELDS.AI_STATUS] = AI_STATUS.COMPLETE
+
+  return fields
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SKIP-CLAUDE CHECK
+// ══════════════════════════════════════════════════════════════════════════════
+// Returns true if this record has all the required Claude-output fields already
+// populated (so we can skip the Claude call entirely).
+
+function hasAllRequiredEnrichmentFields(record) {
+  const f = record.fields
+  const website = f[FIELDS.WEBSITE]
+
+  const basics = [
+    f[FIELDS.TITLE], f[FIELDS.DESCRIPTION], f[FIELDS.SEO_DESCRIPTION],
+    f[FIELDS.SHOPIFY_CATEGORY], f[FIELDS.PRODUCT_IMAGES],
+  ]
+  if (!basics.every(truthy)) return false
+
+  if (FOOTWEAR_STORES.includes(website)) {
+    return truthy(f[FIELDS.OPTION_1_VALUE])
+  }
+  if (website === WEBSITE.LTV) {
+    return true  // opt1/opt2 optional
+  }
+  if (website === WEBSITE.RTV) {
+    return truthy(f[FIELDS.OPTION_3_CUSTOM])
+  }
+  return false
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CLAUDE ENRICHMENT
+// ══════════════════════════════════════════════════════════════════════════════
+
+async function callClaude(recordContext, sources) {
+  const systemPrompt = buildSystemPrompt(recordContext.airtableData.website)
+  const userMessage = buildUserMessage(recordContext, sources)
+
+  try {
+    const response = await withRetry(
+      () => anthropic.messages.create({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 2000,
+        messages: [{ role: 'user', content: userMessage }],
+        system: systemPrompt,
+      }),
+      'Anthropic enrichRecord'
+    )
+    const text = response.content
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('')
+    const clean = text.replace(/^```json\s*/i, '').replace(/\s*```$/, '').trim()
+    return JSON.parse(clean)
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      console.error('Claude returned invalid JSON:', err.message)
+      return {
+        confidence: 'low',
+        missingFields: ['all'],
+        validationIssues: ['Claude returned unparseable response'],
+        error: true,
+      }
+    }
+    throw err
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// BUILD WRITE PAYLOAD FROM CLAUDE OUTPUT
+// ══════════════════════════════════════════════════════════════════════════════
+// (adapted from fieldWriter.js, inlined here)
+
+function buildClaudeWritePayload(claudeOutput, recordContext) {
+  const { airtableData, parsedItem } = recordContext
+  const website = airtableData.website
+  const isFootwear = FOOTWEAR_STORES.includes(website)
+  const isNPCN = NPCN_STORES.includes(website)
+  const isRTV = website === WEBSITE.RTV
+
+  const fields = {}
+  const missingFields = [...(claudeOutput.missingFields || [])]
+
+  // Title
+  if (claudeOutput.title) {
+    let title = claudeOutput.title
+    if (isRTV && parsedItem.conditionCode && CONDITION_LABELS[parsedItem.conditionCode]) {
+      title = `${title} ${CONDITION_LABELS[parsedItem.conditionCode]}`
+    }
+    fields[FIELDS.TITLE] = title
+  } else {
+    missingFields.push('Title')
+  }
+
+  if (claudeOutput.description) fields[FIELDS.DESCRIPTION] = claudeOutput.description
+  else missingFields.push('Description')
+
+  if (claudeOutput.seoDescription) {
+    fields[FIELDS.SEO_DESCRIPTION] = claudeOutput.seoDescription.slice(0, 160)
+  } else missingFields.push('SEO Description')
+
+  if (claudeOutput.shopifyCategory) {
+    fields[FIELDS.SHOPIFY_CATEGORY] = claudeOutput.shopifyCategory
+    const googleId = lookupGoogleCategory(claudeOutput.shopifyCategory)
+    if (googleId) fields[FIELDS.GOOGLE_CATEGORY] = googleId
+  } else missingFields.push('Shopify Category')
+
+  if (isFootwear && claudeOutput.material?.length) {
+    const filtered = claudeOutput.material.filter(m => APPROVED_MATERIALS.includes(m))
+    if (filtered.length) fields[FIELDS.MATERIAL] = filtered
+  }
+
+  if (claudeOutput.option1Value) {
+    fields[FIELDS.OPTION_1_VALUE] = claudeOutput.option1Value
+    if (isFootwear) fields[FIELDS.SDO_COLOR] = claudeOutput.option1Value
+  } else if (isFootwear) {
+    missingFields.push('Option 1 Value (colorway)')
+  }
+
+  if (isNPCN && claudeOutput.option2CustomValue) {
+    fields[FIELDS.OPTION_2_CUSTOM] = claudeOutput.option2CustomValue
+  }
+
+  if (isRTV) {
+    const conditionText = claudeOutput.option3CustomValue ||
+      (parsedItem.conditionCode ? CONDITION_LABELS[parsedItem.conditionCode] : null)
+    if (conditionText) fields[FIELDS.OPTION_3_CUSTOM] = conditionText
+    else missingFields.push('Option 3 Custom Value (used condition)')
+  }
+
+  if (claudeOutput.imageUrls?.length) {
+    fields[FIELDS.PRODUCT_IMAGES] = claudeOutput.imageUrls.map(url => ({ url }))
+    fields[FIELDS.VARIANT_IMAGE_INDEX] = 1
+  } else {
+    missingFields.push('Product Images')
+  }
+
+  // Price
+  const price = claudeOutput.price || null
+  const cost = airtableData.itemCost || null
+  if (price && price > 0) fields[FIELDS.PRICE] = price
+  else if (cost && cost > 0) fields[FIELDS.PRICE] = parseFloat((cost * 1.5).toFixed(2))
+  else missingFields.push('price')
+
+  // Manual condition type fallback
+  if (parsedItem.conditionCode && !parsedItem.conditionCodeFromEnd) {
+    if (!airtableData.manualConditionType) {
+      fields[FIELDS.MANUAL_CONDITION] = parsedItem.conditionCode
+    }
+  }
+
+  const dedupedMissing = [...new Set(missingFields)]
+  const requiredFields = getRequiredFields(website)
+  const missingRequired = dedupedMissing.filter(f => requiredFields.includes(f))
+
+  let status
+  if (claudeOutput.error) status = AI_STATUS.NOT_FOUND
+  else if (missingRequired.length === 0 && claudeOutput.confidence !== 'low') status = AI_STATUS.COMPLETE
+  else if (Object.keys(fields).length > 2) status = AI_STATUS.PARTIAL
+  else status = AI_STATUS.NOT_FOUND
+
+  fields[FIELDS.AI_STATUS] = status
+  if (dedupedMissing.length > 0) fields[FIELDS.AI_MISSING] = dedupedMissing.join(', ')
+
+  return { fields, status, missingFields: dedupedMissing }
+}
+
+function getRequiredFields(website) {
+  const base = ['Title', 'Description', 'SEO Description', 'Shopify Category']
+  switch (website) {
+    case WEBSITE.SDO:
+    case WEBSITE.REBOUND:
+      return [...base, 'Option 1 Value (colorway)', 'Product Images']
+    case WEBSITE.LTV:
+      return [...base, 'Product Images']
+    case WEBSITE.RTV:
+      return [...base, 'Product Images', 'Option 3 Custom Value (used condition)']
+    default:
+      return base
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SOURCE BUILDERS (for Claude input)
+// ══════════════════════════════════════════════════════════════════════════════
+
+function buildAirtableSource(airtableData) {
+  const hasData = airtableData.productName || airtableData.purchaseName ||
+                  airtableData.sdoModelName || airtableData.sdoModelNumber ||
+                  airtableData.sdoColor || airtableData.sdoGender
+  if (!hasData) return null
+  return {
+    name: airtableData.productName || airtableData.purchaseName || null,
+    brand: airtableData.brandCorrectSpelling || airtableData.brand || null,
+    color: airtableData.sdoColor || null,
+    gender: airtableData.sdoGender || null,
+    modelName: airtableData.sdoModelName || null,
+    modelNumber: airtableData.sdoModelNumber || null,
+    description: null,
+    imageUrls: [],
+    raw: {
+      productName: airtableData.productName,
+      purchaseName: airtableData.purchaseName,
+      sdoModelName: airtableData.sdoModelName,
+      sdoModelNumber: airtableData.sdoModelNumber,
+      sdoColor: airtableData.sdoColor,
+      sdoGender: airtableData.sdoGender,
+      sdoAgeRange: airtableData.sdoAgeRange,
+      upcCode: airtableData.upcCode,
+    },
+  }
+}
+
+function buildKeepaSearchQuery(brand, modelNumber, productName) {
+  if (brand && modelNumber) return `${brand} ${modelNumber}`
+  if (brand && productName) return `${brand} ${productName}`
+  if (productName && productName.length > 10) return productName
+  return null
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PROCESS ONE RECORD — MAIN FLOW
+// ══════════════════════════════════════════════════════════════════════════════
+
+async function processRecord(record, loggerInst) {
   const f = record.fields
   const itemNumber = f[FIELDS.ITEM_NUMBER]
   const website = f[FIELDS.WEBSITE]
   const attempts = (f[FIELDS.ENRICHMENT_ATTEMPTS] || 0) + 1
 
-  console.log(`\n[Loop] ${itemNumber} (attempt ${attempts}/${MAX_ATTEMPTS})`)
+  console.log(`\n[Loop] ${itemNumber} [${website}] (attempt ${attempts}/${MAX_ATTEMPTS})`)
 
-  // Increment attempt counter immediately
+  const logCtx = {
+    itemNumber, website, attempts,
+    path: null,  // set as we decide
+    sourcesUsed: [],
+    fieldsWritten: [],
+  }
+
+  // Increment attempt counter, mark Pending
   await writeFields(record.id, {
     [FIELDS.ENRICHMENT_ATTEMPTS]: attempts,
     [FIELDS.LOOP_STATUS]: LOOP_STATUS.PENDING,
   })
 
   // ── PHASE 1: COST CHECK ───────────────────────────────────────────────────
-  if (!hasCost(f)) {
+  const cost = f[FIELDS.ITEM_COST] || 0
+  const costFix = f[FIELDS.COST_FIX]
+  const costFixVal = costFix?.name || costFix
+  if (costFixVal === COST_FIX.NO_DATA) {
+    // Already known unrecoverable
     if (attempts >= MAX_ATTEMPTS) {
-      await parkForVA(record.id, 'Missing cost — unable to find after exhausting all sources')
+      await parkForVA(record.id, 'Missing cost — previously marked No Data', logCtx)
+      writeLog(loggerInst, logCtx, PATH.COST_NO_DATA)
       return 'parked'
     }
-    console.log(`  → Cost missing — skipping enrichment until cost is resolved`)
     return 'skip'
+  }
+  if (cost <= MIN_COST_THRESHOLD) {
+    // Queue for cost-recovery batch
+    console.log(`  → Cost missing — queued for Inventory Values report batch`)
+    addToCostPending(record.id, itemNumber)
+    writeLog(loggerInst, logCtx, PATH.COST_RECOVERY_PENDING)
+    return 'cost_pending'
   }
 
   // ── PHASE 2: UPC RESOLUTION ───────────────────────────────────────────────
   let upc = cleanUPC(f[FIELDS.UPC_CODE])
   if (!upc) {
-    // Try to extract from item number string
     upc = extractUPCFromString(itemNumber)
     if (upc) {
       console.log(`  → Extracted UPC from item number: ${upc}`)
@@ -154,21 +1122,197 @@ async function processRecord(record) {
     }
   }
 
-  // ── PHASE 3: ENRICH ───────────────────────────────────────────────────────
+  // ── PHASE 3: PARSE ITEM NUMBER ────────────────────────────────────────────
   const parsed = parseItemNumber(itemNumber)
   if (!parsed) {
-    await parkForVA(record.id, 'Could not parse item number')
+    await parkForVA(record.id, 'Could not parse item number', logCtx)
+    writeLog(loggerInst, logCtx, PATH.PARKED)
     return 'parked'
   }
 
-  const airtableData = {
-    itemNumber,
+  // ── PHASE 4: UPC HISTORICAL MATCH ─────────────────────────────────────────
+  let upcMatch = null
+  if (upc) {
+    upcMatch = await findMatchByUPC(upc)
+    if (upcMatch) {
+      console.log(`  ✓ UPC match found: ${upcMatch.fields[FIELDS.ITEM_NUMBER]}`)
+      const payload = buildUPCMatchPayload(upcMatch, record, parsed)
+      await writeFields(record.id, payload)
+      logCtx.sourcesUsed.push('UPC Match')
+      logCtx.fieldsWritten = Object.keys(payload).map(k => resolveFieldName(k))
+      // After write, validate
+      const valid = await checkValidation(record.id)
+      if (valid.both) {
+        await markDone(record.id, logCtx)
+        writeLog(loggerInst, logCtx, PATH.UPC_MATCH)
+        return 'done'
+      }
+      // Validation failed even after UPC match — attempts maxed?
+      if (attempts >= MAX_ATTEMPTS) {
+        await parkForVA(record.id, [valid.productWhy, valid.variantWhy].filter(Boolean).join(' | ') || 'Validation failed after UPC match', logCtx)
+        writeLog(loggerInst, logCtx, PATH.PARKED)
+        return 'parked'
+      }
+      // Otherwise retry next pass
+      return 'retry'
+    }
+  }
+
+  // ── PHASE 5: EXTERNAL SOURCE FETCH ────────────────────────────────────────
+  const airtableData = buildAirtableData(record, upc, parsed)
+  const recordContext = { airtableData, parsedItem: parsed }
+  const sources = []
+
+  const airtableSrc = buildAirtableSource(airtableData)
+  if (airtableSrc) sources.push({ type: 'Airtable (existing)', ...airtableSrc })
+
+  // GoFlow
+  console.log(`  → GoFlow: ${itemNumber}`)
+  const goflowData = await goflowLookup(itemNumber)
+  let goflowASIN = null, goflowUPC = null
+  if (goflowData) {
+    sources.push({ type: 'GoFlow', ...goflowData })
+    goflowASIN = goflowData.asin
+    goflowUPC = goflowData.upc
+    if (goflowUPC && !upc) {
+      await writeFields(record.id, { [FIELDS.UPC_CODE]: goflowUPC })
+      upc = goflowUPC
+    }
+    console.log(`  ✓ GoFlow: ${goflowData.name || 'unnamed'}`)
+  }
+
+  // Keepa
+  const finalUPC = upc || goflowUPC || extractUPCFromString(parsed.raw)
+  if (goflowASIN) {
+    console.log(`  → Keepa ASIN: ${goflowASIN}`)
+    const keepaData = await keepaLookupByASIN(goflowASIN)
+    if (keepaData) {
+      sources.push({ type: 'Keepa', ...keepaData })
+      console.log(`  ✓ Keepa: ${keepaData.name || 'unnamed'}`)
+    }
+  } else if (finalUPC) {
+    console.log(`  → Keepa UPC: ${finalUPC}`)
+    const keepaData = await keepaLookupByUPC(finalUPC)
+    if (keepaData) {
+      sources.push({ type: 'Keepa', ...keepaData })
+      if (!f[FIELDS.UPC_CODE] && finalUPC) {
+        await writeFields(record.id, { [FIELDS.UPC_CODE]: finalUPC })
+      }
+      console.log(`  ✓ Keepa: ${keepaData.name || 'unnamed'}`)
+    }
+  }
+
+  if (!sources.some(s => s.type === 'Keepa')) {
+    const modelNumber = airtableData.sdoModelNumber || parsed.modelNumber
+    const brand = airtableData.brandCorrectSpelling || airtableData.brand
+    const searchQuery = buildKeepaSearchQuery(brand, modelNumber, airtableData.productName || airtableData.purchaseName)
+    if (searchQuery) {
+      console.log(`  → Keepa search: "${searchQuery}"`)
+      const keepaData = await keepaSearch(searchQuery)
+      if (keepaData) {
+        sources.push({ type: 'Keepa (search)', ...keepaData })
+        console.log(`  ✓ Keepa search: ${keepaData.name || 'unnamed'}`)
+      }
+    }
+  }
+
+  logCtx.sourcesUsed = sources.map(s => s.type)
+
+  // ── PHASE 6: GENDER/SIZE EXTRACTION (SDO/REBOUND only) ────────────────────
+  if (FOOTWEAR_STORES.includes(website)) {
+    const attrs = extractAttributes(record, sources, parsed, null)
+    if (attrs.noSize) {
+      if (attempts >= MAX_ATTEMPTS) {
+        await parkForVA(record.id, 'Size not extractable from any source', logCtx)
+        writeLog(loggerInst, logCtx, PATH.PARKED)
+        return 'parked'
+      }
+      return 'retry'
+    }
+    if (attrs.sizeFields) {
+      await writeFields(record.id, attrs.sizeFields)
+      console.log(`  ✓ Wrote gender/size: ${attrs.gender}/${attrs.ageRange} size ${attrs.size}${attrs.width}`)
+    }
+  }
+
+  // ── PHASE 7: SKIP CLAUDE IF ALREADY ENRICHED ──────────────────────────────
+  // Re-fetch to check current state (we may have just written gender/size)
+  const current = await refetchRecord(record.id)
+  if (hasAllRequiredEnrichmentFields(current)) {
+    console.log(`  → All required enrichment fields already present — skipping Claude`)
+    const valid = await checkValidation(record.id)
+    if (valid.both) {
+      await markDone(record.id, logCtx)
+      writeLog(loggerInst, logCtx, PATH.SKIP_CLAUDE_EXISTING)
+      return 'done'
+    }
+    if (attempts >= MAX_ATTEMPTS) {
+      await parkForVA(record.id, [valid.productWhy, valid.variantWhy].filter(Boolean).join(' | ') || 'Validation failed', logCtx)
+      writeLog(loggerInst, logCtx, PATH.PARKED)
+      return 'parked'
+    }
+    return 'retry'
+  }
+
+  // ── PHASE 8: CLAUDE ENRICHMENT ────────────────────────────────────────────
+  if (sources.length === 0) {
+    console.log(`  ✗ No sources found`)
+    if (attempts >= MAX_ATTEMPTS) {
+      await parkForVA(record.id, 'No product data found after exhausting all sources', logCtx)
+      writeLog(loggerInst, logCtx, PATH.PARKED)
+      return 'parked'
+    }
+    await writeFields(record.id, { [FIELDS.AI_STATUS]: AI_STATUS.NOT_FOUND })
+    return 'not_found'
+  }
+
+  console.log(`  → Calling Claude (${sources.length} source(s))`)
+  const claudeOutput = await callClaude(recordContext, sources)
+
+  // Inject price if Claude didn't find one
+  if (!claudeOutput.price) {
+    const goflowSource = sources.find(s => s.type === 'GoFlow')
+    if (goflowSource?.listingPrice > 0) claudeOutput.price = goflowSource.listingPrice
+    const keepaSource = sources.find(s => s.type?.startsWith('Keepa'))
+    if (!claudeOutput.price && keepaSource?.currentPrice > 0) claudeOutput.price = keepaSource.currentPrice
+  }
+
+  const { fields, status, missingFields } = buildClaudeWritePayload(claudeOutput, recordContext)
+  await writeFields(record.id, fields)
+  console.log(`  → ${status}${missingFields?.length ? ` (missing: ${missingFields.join(', ')})` : ''}`)
+  logCtx.fieldsWritten = Object.keys(fields).map(k => resolveFieldName(k))
+
+  // ── PHASE 9: VALIDATE AND FINALIZE ────────────────────────────────────────
+  const valid = await checkValidation(record.id)
+  if (valid.both) {
+    await markDone(record.id, logCtx)
+    writeLog(loggerInst, logCtx, PATH.CLAUDE_FULL)
+    return 'done'
+  }
+
+  if (attempts >= MAX_ATTEMPTS) {
+    const reason = [valid.productWhy, valid.variantWhy].filter(Boolean).join(' | ') || 'Validation failed after max attempts'
+    await parkForVA(record.id, reason, logCtx)
+    writeLog(loggerInst, logCtx, PATH.PARKED)
+    return 'parked'
+  }
+  return 'retry'
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Helpers used by processRecord
+// ──────────────────────────────────────────────────────────────────────────────
+
+function buildAirtableData(record, upc, parsed) {
+  const f = record.fields
+  return {
+    itemNumber: f[FIELDS.ITEM_NUMBER],
     brand: f[FIELDS.BRAND],
     brandCorrectSpelling: f[FIELDS.BRAND_CORRECT_SPELL],
     condition: f[FIELDS.CONDITION],
     conditionCode: f[FIELDS.CONDITION_TYPE] || parsed.conditionCode,
     manualConditionType: f[FIELDS.MANUAL_CONDITION],
-    website,
+    website: f[FIELDS.WEBSITE],
     productName: f[FIELDS.PRODUCT_NAME],
     purchaseName: f[FIELDS.PURCHASE_NAME],
     upcCode: upc || f[FIELDS.UPC_CODE],
@@ -186,235 +1330,168 @@ async function processRecord(record) {
     sdoRetailPrice: f[FIELDS.SDO_RETAIL_PRICE],
     brandSite: f[FIELDS.BRAND_SITE],
     otherSite: f[FIELDS.OTHER_SITE],
-    asin: null, // ASIN sourced from GoFlow only
+    asin: null,
     itemCost: f[FIELDS.ITEM_COST],
   }
+}
 
-  const recordContext = { airtableData, parsedItem: parsed }
-  const sources = []
-
-  // Airtable existing data
-  const airtableSource = buildAirtableSource(airtableData)
-  if (airtableSource) sources.push({ type: 'Airtable (existing)', ...airtableSource })
-
-  // Airtable model match
-  const modelNumber = airtableData.sdoModelNumber || parsed.modelNumber
-  const brand = airtableData.brandCorrectSpelling || airtableData.brand
-  if (modelNumber) {
-    const matches = await findMatchesByModel(modelNumber, brand)
-    if (matches.length > 0) {
-      console.log(`  ✓ Airtable model match found`)
-      const variantMatch = matches.find(m => {
-        const mc = m.fields[FIELDS.SDO_COLOR]
-        return mc && airtableData.sdoColor &&
-          mc.toLowerCase() === airtableData.sdoColor.toLowerCase()
-      })
-      const match = variantMatch || matches[0]
-      sources.push({ type: 'Airtable match', ...extractMatchData(match, !!variantMatch) })
-    }
-  }
-
-  // GoFlow
-  console.log(`  → GoFlow: ${itemNumber}`)
-  const goflowData = await goflowLookup(itemNumber)
-  let goflowASIN = null
-  let goflowUPC = null
-  if (goflowData) {
-    sources.push({ type: 'GoFlow', ...goflowData })
-    goflowASIN = goflowData.asin
-    goflowUPC = goflowData.upc
-    // Write UPC if we found one and don't have it yet
-    if (goflowUPC && !upc) {
-      await writeFields(record.id, { [FIELDS.UPC_CODE]: goflowUPC })
-      upc = goflowUPC
-    }
-    console.log(`  ✓ GoFlow: ${goflowData.name || 'unnamed'}`)
-  }
-
-  // Keepa — ASIN first, then UPC, then search
-  const asin = goflowASIN
-  const finalUPC = upc || goflowUPC || extractUPCFromString(parsed.raw)
-
-  if (asin) {
-    console.log(`  → Keepa ASIN: ${asin}`)
-    const keepaData = await lookupByASIN(asin)
-    if (keepaData) {
-      sources.push({ type: 'Keepa', ...keepaData })
-      console.log(`  ✓ Keepa: ${keepaData.name || 'unnamed'}`)
-    }
-  } else if (finalUPC) {
-    console.log(`  → Keepa UPC: ${finalUPC}`)
-    const keepaData = await keepaLookupByUPC(finalUPC)
-    if (keepaData) {
-      sources.push({ type: 'Keepa', ...keepaData })
-      // Write UPC back if we used it successfully
-      if (!f[FIELDS.UPC_CODE] && finalUPC) {
-        await writeFields(record.id, { [FIELDS.UPC_CODE]: finalUPC })
-      }
-      console.log(`  ✓ Keepa: ${keepaData.name || 'unnamed'}`)
-    }
-  }
-
-  // Keepa search fallback
-  if (!sources.some(s => s.type === 'Keepa')) {
-    const searchQuery = buildKeepaSearchQuery(brand, modelNumber, airtableData.productName || airtableData.purchaseName)
-    if (searchQuery) {
-      console.log(`  → Keepa search: "${searchQuery}"`)
-      const keepaData = await keepaSearch(searchQuery)
-      if (keepaData) {
-        sources.push({ type: 'Keepa (search)', ...keepaData })
-        console.log(`  ✓ Keepa search: ${keepaData.name || 'unnamed'}`)
-      }
-    }
-  }
-
-  // No sources at all
-  if (sources.length === 0) {
-    console.log(`  ✗ No sources found`)
-    if (attempts >= MAX_ATTEMPTS) {
-      await parkForVA(record.id, 'No product data found after exhausting all sources')
-      return 'parked'
-    }
-    await writeFields(record.id, { [FIELDS.AI_STATUS]: AI_STATUS.NOT_FOUND })
-    return 'not_found'
-  }
-
-  // Claude enrichment
-  console.log(`  → Calling Claude (${sources.length} source(s))`)
-  const claudeOutput = await enrichRecord(recordContext, sources)
-
-  // Inject price if Claude didn't find one
-  if (!claudeOutput.price) {
-    const goflowSource = sources.find(s => s.type === 'GoFlow')
-    if (goflowSource?.listingPrice > 0) claudeOutput.price = goflowSource.listingPrice
-    const keepaSource = sources.find(s => s.type?.startsWith('Keepa'))
-    if (!claudeOutput.price && keepaSource?.currentPrice > 0) claudeOutput.price = keepaSource.currentPrice
-  }
-
-  // Build and write payload
-  const { fields, status, missingFields } = buildWritePayload(claudeOutput, recordContext)
-  await writeFields(record.id, fields)
-
-  console.log(`  → ${status}${missingFields?.length ? ` (missing: ${missingFields.join(', ')})` : ''}`)
-
-  // ── PHASE 4: CHECK FORMULAS ───────────────────────────────────────────────
-  // Re-fetch to get updated formula values
-  await delay(RATE_DELAY * 2) // give Airtable a moment to recalculate
-  const freshRecords = await table().select({
+async function refetchRecord(recordId) {
+  const records = await table().select({
     returnFieldsByFieldId: true,
-    filterByFormula: `RECORD_ID() = '${record.id}'`,
+    filterByFormula: `RECORD_ID() = '${recordId}'`,
+    fields: QUEUE_FIELDS,
+  }).firstPage()
+  return records[0]
+}
+
+async function checkValidation(recordId) {
+  await delay(RATE_DELAY * 2)  // let Airtable recalculate formulas
+  const records = await table().select({
+    returnFieldsByFieldId: true,
+    filterByFormula: `RECORD_ID() = '${recordId}'`,
     fields: [FIELDS.PRODUCT_INFO_VALID, FIELDS.VARIANT_INFO_VALID, FIELDS.PRODUCT_INVALID_WHY, FIELDS.VARIANT_INVALID_WHY],
   }).firstPage()
-  const fresh = freshRecords[0]
-  const productValid = fresh?.fields[FIELDS.PRODUCT_INFO_VALID]
-  const variantValid = fresh?.fields[FIELDS.VARIANT_INFO_VALID]
-
+  const f = records[0]?.fields || {}
+  const productValid = f[FIELDS.PRODUCT_INFO_VALID]
+  const variantValid = f[FIELDS.VARIANT_INFO_VALID]
   console.log(`  → Product Valid: ${productValid} | Variant Valid: ${variantValid}`)
-
-  if (productValid === 'YES' && variantValid === 'YES') {
-    await markDone(record.id)
-    console.log(`  ✓ DONE — PD Ready Hold set`)
-    return 'done'
+  return {
+    both: productValid === 'YES' && variantValid === 'YES',
+    productValid, variantValid,
+    productWhy: f[FIELDS.PRODUCT_INVALID_WHY] || '',
+    variantWhy: f[FIELDS.VARIANT_INVALID_WHY] || '',
   }
-
-  // Not done yet — check if we've hit max attempts
-  if (attempts >= MAX_ATTEMPTS) {
-    // Identify what's still blocking
-    const productWhy = fresh.fields[FIELDS.PRODUCT_INVALID_WHY] || ''
-    const variantWhy = fresh.fields[FIELDS.VARIANT_INVALID_WHY] || ''
-    const reason = [productWhy, variantWhy].filter(Boolean).join(' | ') || 'Validation failed after max attempts'
-    await parkForVA(record.id, reason)
-    return 'parked'
-  }
-
-  return 'retry'
 }
 
-// ─── Helper functions ─────────────────────────────────────────────────────────
-function buildAirtableSource(data) {
-  const hasData = data.productName || data.purchaseName || data.sdoModelName || data.sdoModelNumber || data.sdoColor || data.sdoGender
-  if (!hasData) return null
-  return {
-    name: data.productName || data.purchaseName || null,
-    brand: data.brandCorrectSpelling || data.brand || null,
-    color: data.sdoColor || null,
-    gender: data.sdoGender || null,
-    modelName: data.sdoModelName || null,
-    modelNumber: data.sdoModelNumber || null,
-    description: null,
-    imageUrls: [],
-    raw: {
-      productName: data.productName,
-      purchaseName: data.purchaseName,
-      sdoModelName: data.sdoModelName,
-      sdoModelNumber: data.sdoModelNumber,
-      sdoColor: data.sdoColor,
-      sdoGender: data.sdoGender,
-      sdoAgeRange: data.sdoAgeRange,
-      upcCode: data.upcCode,
-      
+// Log via shared WorkerLogger — uses existing per-record log() method
+// Adds enrichmentPath to the log entry
+function writeLog(loggerInst, ctx, path) {
+  if (!loggerInst) return
+  loggerInst.log({
+    itemNumber: ctx.itemNumber,
+    website: ctx.website,
+    outcome: path,
+    sourcesUsed: ctx.sourcesUsed,
+    fieldsWritten: ctx.fieldsWritten,
+    enrichmentPath: path,
+  })
+}
+
+// Field-ID → human name helper (for FIELDS_WRITTEN column in log)
+const FIELD_NAME_MAP = Object.fromEntries(Object.entries(FIELDS).map(([k, v]) => [v, k]))
+function resolveFieldName(fieldId) {
+  return FIELD_NAME_MAP[fieldId] || fieldId
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// RESET PARKED (startup helper, triggered by RESET_PARKED=true)
+// ══════════════════════════════════════════════════════════════════════════════
+
+async function resetAllParked() {
+  console.log(`[Reset Parked] Fetching records with Loop Status = Needs VA...`)
+  const ids = []
+  await table().select({
+    returnFieldsByFieldId: true,
+    filterByFormula: `{${FIELDS.LOOP_STATUS}} = '${LOOP_STATUS.NEEDS_VA}'`,
+    fields: [FIELDS.ITEM_NUMBER],
+  }).eachPage((page, next) => {
+    for (const r of page) ids.push(r.id)
+    next()
+  })
+  console.log(`[Reset Parked] Found ${ids.length} parked records to reset`)
+
+  const BATCH = 10
+  let done = 0
+  for (let i = 0; i < ids.length; i += BATCH) {
+    const batch = ids.slice(i, i + BATCH)
+    const updates = batch.map(id => ({
+      id,
+      fields: {
+        [FIELDS.LOOP_STATUS]: null,
+        [FIELDS.ENRICHMENT_ATTEMPTS]: 0,
+        [FIELDS.VA_NEEDED]: null,
+      },
+    }))
+    try {
+      await delay(RATE_DELAY)
+      await table().update(updates)
+      done += batch.length
+      process.stdout.write(`\r  Reset ${done}/${ids.length}`)
+    } catch (err) {
+      console.error(`\n  Reset batch error: ${err.message}`)
     }
   }
+  console.log(`\n[Reset Parked] Done — reset ${done} records`)
 }
 
-function extractMatchData(record, isVariant) {
-  const f = record.fields
-  return {
-    name: f[FIELDS.TITLE] || null,
-    brand: null,
-    description: f[FIELDS.DESCRIPTION] || null,
-    imageUrls: isVariant ? (f[FIELDS.PRODUCT_IMAGES] || []).map(img => img.url) : [],
-    raw: {
-      title: f[FIELDS.TITLE],
-      shopifyCategory: f[FIELDS.SHOPIFY_CATEGORY],
-      googleCategory: f[FIELDS.GOOGLE_CATEGORY],
-      material: f[FIELDS.MATERIAL],
-      option1Value: isVariant ? f[FIELDS.SDO_COLOR] : null,
-    }
-  }
-}
+// ══════════════════════════════════════════════════════════════════════════════
+// MAIN LOOP
+// ══════════════════════════════════════════════════════════════════════════════
 
-function buildKeepaSearchQuery(brand, model, productName) {
-  if (brand && model) return `${brand} ${model}`
-  if (brand && productName) return `${brand} ${productName}`
-  if (productName && productName.length > 10) return productName
-  return null
-}
-
-// ─── Main loop ────────────────────────────────────────────────────────────────
 async function run() {
-  const logger = new WorkerLogger('loop')
+  const loggerInst = new WorkerLogger('loop')
   let passCount = 0
+  let totalProcessedThisBoot = 0
 
-  console.log(`[Loop] Starting continuous enrichment loop at ${new Date().toISOString()}`)
+  console.log(`[Loop] Starting at ${new Date().toISOString()}`)
   console.log(`[Loop] Max attempts per record: ${MAX_ATTEMPTS}`)
+  if (DRY_RUN_LIMIT !== null) console.log(`[Loop] DRY_RUN_LIMIT set: ${DRY_RUN_LIMIT}`)
+  if (RESET_PARKED) console.log(`[Loop] RESET_PARKED set: will reset parked records on startup`)
+
+  if (RESET_PARKED) {
+    await resetAllParked()
+  }
 
   while (true) {
     passCount++
     const passStart = Date.now()
-    console.log(`\n${'═'.repeat(50)}`)
+    console.log(`\n${'═'.repeat(60)}`)
     console.log(`[Loop] Pass ${passCount} starting at ${new Date().toISOString()}`)
-    console.log(`${'═'.repeat(50)}`)
+    console.log(`${'═'.repeat(60)}`)
 
     const records = await fetchQueue()
     console.log(`[Loop] Found ${records.length} records in queue`)
 
-    if (records.length === 0) {
-      console.log(`[Loop] Queue empty — sleeping 60s before next pass`)
+    // Optional DRY_RUN_LIMIT cap — process at most N records this entire run
+    let batch = records
+    if (DRY_RUN_LIMIT !== null) {
+      const remaining = DRY_RUN_LIMIT - totalProcessedThisBoot
+      if (remaining <= 0) {
+        console.log(`[Loop] DRY_RUN_LIMIT reached (${DRY_RUN_LIMIT} records) — exiting`)
+        await drainCostQueue(loggerInst)  // one last batch if pending
+        await loggerInst.finish({ dryRunExit: true })
+        process.exit(0)
+      }
+      batch = records.slice(0, remaining)
+      console.log(`[Loop] DRY_RUN_LIMIT: processing ${batch.length} of ${records.length}`)
+    }
+
+    if (batch.length === 0) {
+      // No queue — still check if we should drain cost pending
+      if (shouldFireCostBatch()) {
+        await fireCostBatch(loggerInst)
+      }
+      console.log(`[Loop] Queue empty — sleeping 60s`)
       await delay(60000)
       continue
     }
 
-    const results = { done: 0, retry: 0, parked: 0, skip: 0, not_found: 0, error: 0 }
+    const results = { done: 0, retry: 0, parked: 0, skip: 0, cost_pending: 0, not_found: 0, error: 0 }
 
-    for (const record of records) {
+    for (const record of batch) {
       try {
-        const outcome = await processRecord(record)
+        const outcome = await processRecord(record, loggerInst)
         results[outcome] = (results[outcome] || 0) + 1
+        totalProcessedThisBoot++
+
+        // Fire cost batch if trigger conditions met
+        if (shouldFireCostBatch()) {
+          await fireCostBatch(loggerInst)
+        }
       } catch (err) {
         console.error(`  ERROR: ${err.message}`)
+        console.error(err.stack)
         results.error++
-        // Write error to VA Needed so it's visible
         try {
           await writeFields(record.id, {
             [FIELDS.VA_NEEDED]: `Error: ${err.message.slice(0, 200)}`,
@@ -423,19 +1500,52 @@ async function run() {
       }
     }
 
+    // End-of-pass: drain any remaining cost pending records
+    if (costPending.length > 0) {
+      console.log(`\n[Loop] End of pass — ${costPending.length} records in cost pending`)
+      if (shouldFireCostBatch()) await fireCostBatch(loggerInst)
+    }
+
     const durationS = ((Date.now() - passStart) / 1000).toFixed(0)
     console.log(`\n[Loop] Pass ${passCount} complete in ${durationS}s`)
-    console.log(`  Done: ${results.done} | Retry: ${results.retry} | Parked: ${results.parked} | Skip: ${results.skip} | Errors: ${results.error}`)
+    console.log(`  Done: ${results.done} | Retry: ${results.retry} | Parked: ${results.parked} | Skip: ${results.skip} | CostPending: ${results.cost_pending} | Errors: ${results.error}`)
 
-    await logger.finish({
+    await loggerInst.finish({
       complete: results.done,
       partial: results.retry,
       notFound: results.not_found,
+      parked: results.parked,
+      cost_pending: results.cost_pending,
     })
+
+    // If DRY_RUN_LIMIT set and we've hit it, exit
+    if (DRY_RUN_LIMIT !== null && totalProcessedThisBoot >= DRY_RUN_LIMIT) {
+      console.log(`[Loop] DRY_RUN_LIMIT reached — draining cost queue and exiting`)
+      await drainCostQueue(loggerInst)
+      process.exit(0)
+    }
   }
 }
 
-run().catch(err => {
-  console.error('[Loop] Fatal:', err)
-  process.exit(1)
-})
+async function drainCostQueue(loggerInst) {
+  if (!costPending.length) return
+  console.log(`[Loop] Draining cost queue (${costPending.length} records)`)
+  costLastFireAt = 0  // force fire
+  while (costPending.length > 0) {
+    await fireCostBatch(loggerInst)
+    await delay(1000)
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ENTRY POINT
+// ══════════════════════════════════════════════════════════════════════════════
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  run().catch(err => {
+    console.error('[Loop] Fatal:', err)
+    process.exit(1)
+  })
+}
+
+export { run, processRecord, extractAttributes, findMatchByUPC }

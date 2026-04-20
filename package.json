@@ -1,28 +1,21 @@
 {
   "name": "dob-ai-enrichment",
-  "version": "1.0.0",
-  "description": "AI-powered product data enrichment pipeline for DOB Shopify stores",
+  "version": "2.0.0",
+  "description": "AI-powered product data enrichment pipeline for DOB Shopify stores (monolith)",
   "type": "module",
   "scripts": {
-    "brand": "node src/workers/brandResolution.js",
-    "enrich": "node src/workers/enrichment.js",
-    "report": "node src/workers/statusReport.js",
     "loop": "node src/workers/loop.js",
+    "dev:loop": "node --watch src/workers/loop.js",
+    "brand": "node src/workers/brandResolution.js",
     "dev:brand": "node --watch src/workers/brandResolution.js",
-    "dev:enrich": "node --watch src/workers/enrichment.js",
-    "validate": "node src/workers/validate.js",
-    "cost": "node src/workers/costLookup.js",
-    "backlog": "node src/workers/backlog.js",
     "build:taxonomy": "node scripts/fetch-taxonomy.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
     "airtable": "^0.12.2",
     "axios": "^1.7.0",
-    "cheerio": "^1.0.0",
     "dotenv": "^16.4.0",
-    "fuse.js": "^7.0.0",
-    "node-cron": "^3.0.3"
+    "fuse.js": "^7.0.0"
   },
   "engines": {
     "node": ">=18.0.0"
