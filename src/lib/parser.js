@@ -272,3 +272,66 @@ export function extractBrandCandidate(itemNumber) {
   const candidates = extractBrandCandidates(itemNumber)
   return candidates[0] || null
 }
+
+// Generate sibling candidates for cost/enrichment fallback lookup.
+//
+// "Sibling" = another record or GoFlow product that shares the same underlying
+// physical item as this record, just with a different condition suffix. When
+// the suffixed item in GoFlow has $0 Avg Cost, a sibling (different condition
+// of the same item) often has real cost data. Example:
+//
+//   Saucony_S10810_05_Size_10_5M_195018769756_UVG  ($0 in GoFlow)
+//   Saucony_S10810_05_Size_10_5M_195018769756      (base — same phys. item)
+//   Saucony_S10810_05_Size_10_5M_195018769756_UGD  (sibling — may have cost)
+//
+// Returns:
+//   {
+//     base:               string,          // base item number, condition stripped (or null)
+//     upc:                string,          // clean UPC extracted from UPC_CODE or item number (or null)
+//     enumeratedSiblings: string[],        // base + base+_COND for every known condition code
+//   }
+//
+// If item number has no condition suffix, `base` equals the input.
+// If no UPC can be extracted from either upcCode or itemNumber, `upc` is null.
+// `enumeratedSiblings` always includes the base itself first, so callers can
+// submit this list directly to the GoFlow Inventory Values report.
+export function generateSiblingCandidates(itemNumber, upcCode) {
+  const result = { base: null, upc: null, enumeratedSiblings: [] }
+  if (!itemNumber) return result
+
+  const parsed = parseItemNumber(itemNumber)
+  if (!parsed) return result
+
+  // Base = item number with condition suffix stripped (case-insensitive).
+  // parseItemNumber already handles both upper and lower case via /i flag.
+  result.base = parsed.baseItemNumber || null
+
+  // UPC resolution cascade: cleanUPC(upcCode) first, fallback extract from item number.
+  // Mirrors loop.js phase-2 logic.
+  let upc = cleanUPC(upcCode)
+  if (!upc) {
+    const m = (itemNumber || '').match(/(?<![0-9])(\d{12,14})(?![0-9])/)
+    if (m) upc = m[1]
+  }
+  result.upc = upc
+
+  // Enumerate condition-variant siblings under the same base.
+  // Includes base itself (no suffix) since GoFlow often has a bare-base product
+  // representing the "unconditioned" SKU — see the Saucony UI screenshot where
+  // `Saucony_S10810_05_Size_10_5M` exists alongside the suffixed variants.
+  if (result.base) {
+    const codes = ['NMB', 'ULN', 'UVG', 'UGD', 'UAI', 'UAC', 'UDF']
+    const siblings = [result.base]
+    for (const code of codes) {
+      siblings.push(`${result.base}_${code}`)
+    }
+    // Deduplicate — the record's own item number (suffixed form) is a valid
+    // sibling too but MUST be included so a caller querying "any sibling with
+    // cost > 0" still considers the original record's entry. However, the
+    // base here is already stripped so the enumerated list won't accidentally
+    // exclude the record itself when it gets added back via suffix.
+    result.enumeratedSiblings = [...new Set(siblings)]
+  }
+
+  return result
+}

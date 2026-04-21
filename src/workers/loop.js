@@ -39,7 +39,7 @@ import {
   CONDITION_LABELS, APPROVED_MATERIALS, AI_COST_CHECK, COST_FIX,
 } from '../config/fields.js'
 import { lookupGoogleCategory } from '../config/taxonomy.js'
-import { parseItemNumber, cleanUPC } from '../lib/parser.js'
+import { parseItemNumber, cleanUPC, generateSiblingCandidates } from '../lib/parser.js'
 import { withRetry } from '../lib/retry.js'
 import { WorkerLogger } from '../lib/logger.js'
 import { buildSystemPrompt, buildUserMessage } from '../prompts/enrichmentPrompt.js'
@@ -50,14 +50,16 @@ import { buildSystemPrompt, buildUserMessage } from '../prompts/enrichmentPrompt
 
 const MAX_ATTEMPTS = 3
 const RATE_DELAY = parseInt(process.env.AIRTABLE_RATE_DELAY_MS || '250')
-const MIN_COST_THRESHOLD = parseFloat(process.env.MIN_COST_THRESHOLD || '1.00')
+const MIN_COST_THRESHOLD = parseFloat(process.env.MIN_COST_THRESHOLD || '0.02')
 
 const DRY_RUN_LIMIT = process.env.DRY_RUN_LIMIT
   ? parseInt(process.env.DRY_RUN_LIMIT) : null
 const RESET_PARKED = process.env.RESET_PARKED === 'true'
 
 // Cost recovery batching
-const COST_BATCH_SIZE = 500
+// GoFlow's Inventory Values report caps product_item_number.values at 100 per
+// call (per API spec). Submitting more would return a 400. Keep at spec limit.
+const COST_BATCH_SIZE = 100
 const COST_BATCH_TIMEOUT_MS = 5 * 60 * 1000  // 5 min
 const COST_REPORT_POLL_INTERVAL_MS = 5000    // 5s
 
@@ -289,6 +291,114 @@ async function findMatchByUPC(cleanUpc) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// AIRTABLE: SIBLING COST LOOKUP (Stage 1)
+// ══════════════════════════════════════════════════════════════════════════════
+// Find a record with the same base item number OR same UPC that ALREADY has
+// a valid cost. Used as a cheap pre-check before firing a GoFlow report.
+//
+// Pools two queries:
+//   1.A  {GLOBAL_ITEM_NUMBER} = base         → cross-condition siblings
+//   1.B  {VARIANT_BARCODE}    = cleanUpc     → cross-size/colorway/brand via UPC
+//
+// Combines results, returns the MIN non-zero cost. Min (not max) is the
+// conservative choice — avoids inflating price markup when siblings disagree.
+//
+// Returns: { cost, source } or null.
+
+async function findSiblingCostInAirtable(candidates) {
+  const { base, upc } = candidates || {}
+  if (!base && !upc) return null
+
+  const records = []
+
+  // Query 1.A — base match (cross-condition)
+  if (base) {
+    const safe = base.replace(/'/g, "\\'")
+    try {
+      await table().select({
+        returnFieldsByFieldId: true,
+        filterByFormula: `AND(
+          {${FIELDS.GLOBAL_ITEM_NUMBER}} = '${safe}',
+          {${FIELDS.ITEM_COST}} > ${MIN_COST_THRESHOLD}
+        )`,
+        fields: [FIELDS.ITEM_NUMBER, FIELDS.ITEM_COST],
+        maxRecords: 10,
+      }).eachPage((page, next) => { records.push(...page); next() })
+    } catch (err) {
+      console.log(`  - Airtable sibling (base) query failed: ${err.message}`)
+    }
+  }
+
+  // Query 1.B — UPC match (cross-size/colorway)
+  if (upc) {
+    const safe = String(upc).replace(/'/g, "\\'")
+    try {
+      await table().select({
+        returnFieldsByFieldId: true,
+        filterByFormula: `AND(
+          {${FIELDS.VARIANT_BARCODE}} = '${safe}',
+          {${FIELDS.ITEM_COST}} > ${MIN_COST_THRESHOLD}
+        )`,
+        fields: [FIELDS.ITEM_NUMBER, FIELDS.ITEM_COST],
+        maxRecords: 10,
+      }).eachPage((page, next) => { records.push(...page); next() })
+    } catch (err) {
+      console.log(`  - Airtable sibling (upc) query failed: ${err.message}`)
+    }
+  }
+
+  if (records.length === 0) return null
+
+  // Min non-zero cost across all sibling hits (conservative choice).
+  let minCost = Infinity
+  let source = null
+  for (const r of records) {
+    const c = Number(r.fields[FIELDS.ITEM_COST])
+    if (c > MIN_COST_THRESHOLD && c < minCost) {
+      minCost = c
+      source = r.fields[FIELDS.ITEM_NUMBER]
+    }
+  }
+  if (minCost === Infinity) return null
+  return { cost: minCost, source }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// AIRTABLE: SIBLING ENRICHMENT LOOKUP (wider-key fallback after findMatchByUPC)
+// ══════════════════════════════════════════════════════════════════════════════
+// Runs ONLY if findMatchByUPC returned null. Queries for a shipped record
+// sharing the same base item number (cross-condition siblings only). Uses
+// the existing MATCH_FIELDS + buildUPCMatchPayload shape for drop-in use.
+//
+// Intentionally narrow — brand+model siblings are NOT used for enrichment
+// because colorway-specific fields (Option 1 Value, SDO_Color) would be
+// wrong for a different-colorway sibling. Same-base siblings are same
+// physical SKU, different condition only — safe to copy.
+
+async function findSiblingEnrichmentByBase(base) {
+  if (!base) return null
+  const safe = base.replace(/'/g, "\\'")
+  const records = []
+  try {
+    await table().select({
+      returnFieldsByFieldId: true,
+      filterByFormula: `AND(
+        {${FIELDS.GLOBAL_ITEM_NUMBER}} = '${safe}',
+        {${FIELDS.PD_READY}} = 1
+      )`,
+      fields: MATCH_FIELDS,
+      maxRecords: 5,
+      sort: [{ field: FIELDS.ITEM_NUMBER, direction: 'desc' }],
+    }).eachPage((page, next) => { records.push(...page); next() })
+  } catch (err) {
+    console.log(`  - Sibling enrichment query failed: ${err.message}`)
+    return null
+  }
+  return records[0] || null
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════════
 // GOFLOW: PRODUCT LOOKUP
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -419,28 +529,71 @@ async function fetchReportFile(fileUrl) {
 }
 
 // ═══ Cost-recovery pending-list state (module-scoped) ════════════════════════
-// Each entry: { recordId, itemNumber }
+// Each entry: { recordId, itemNumber, siblings }
+//   itemNumber — the record's own GoFlow item number (primary lookup target)
+//   siblings   — enumerated condition-variant item numbers (Stage 2 sibling
+//                lookup fallback). If the primary returns $0, any sibling with
+//                non-zero cost satisfies the record.
+// The batch dedupes item numbers globally (primary + all siblings across all
+// records) and submits up to COST_BATCH_SIZE unique names. On apply, each
+// record takes MIN non-zero cost across its primary + siblings.
 let costPending = []
 let costLastFireAt = 0
 
-function addToCostPending(recordId, itemNumber) {
-  costPending.push({ recordId, itemNumber })
+function addToCostPending(recordId, itemNumber, siblings = []) {
+  costPending.push({ recordId, itemNumber, siblings })
+}
+
+// For rate-limit planning: the pending list is sized by UNIQUE item names
+// (primary + siblings deduped), not by record count. N records with 8
+// siblings each collapse to ~8N unique names in the worst case.
+function pendingUniqueItemCount() {
+  const set = new Set()
+  for (const p of costPending) {
+    if (p.itemNumber) set.add(p.itemNumber)
+    for (const s of p.siblings || []) set.add(s)
+  }
+  return set.size
 }
 
 function shouldFireCostBatch() {
-  if (costPending.length >= COST_BATCH_SIZE) return true
+  if (pendingUniqueItemCount() >= COST_BATCH_SIZE) return true
   if (costPending.length >= 1 && (Date.now() - costLastFireAt) >= COST_BATCH_TIMEOUT_MS) return true
   return false
 }
 
 async function fireCostBatch(loggerInst) {
   if (!costPending.length) return
-  const batch = costPending.slice(0, COST_BATCH_SIZE)
-  costPending = costPending.slice(COST_BATCH_SIZE)
+
+  // Pull as many records as we can fit under COST_BATCH_SIZE unique item names.
+  // Each record contributes 1 primary + N siblings (typically ≤8 total). Walk
+  // records in FIFO and stop before exceeding the unique-name cap.
+  const uniqueNames = new Set()
+  const batch = []
+  const remainder = []
+  for (const p of costPending) {
+    const candidateNames = new Set(uniqueNames)
+    if (p.itemNumber) candidateNames.add(p.itemNumber)
+    for (const s of p.siblings || []) candidateNames.add(s)
+    if (candidateNames.size <= COST_BATCH_SIZE) {
+      batch.push(p)
+      for (const n of candidateNames) uniqueNames.add(n)
+    } else if (batch.length === 0) {
+      // Single record's candidate set exceeds batch size — take it anyway,
+      // truncated to COST_BATCH_SIZE. Alternative is infinite hang.
+      const trimmedNames = [p.itemNumber, ...(p.siblings || [])].filter(Boolean).slice(0, COST_BATCH_SIZE)
+      batch.push({ ...p, siblings: trimmedNames.filter(n => n !== p.itemNumber) })
+      for (const n of trimmedNames) uniqueNames.add(n)
+    } else {
+      remainder.push(p)
+    }
+  }
+  costPending = remainder
   costLastFireAt = Date.now()
 
-  const itemNumbers = batch.map(b => b.itemNumber)
-  console.log(`\n[Cost Batch] Submitting ${itemNumbers.length} items to Inventory Values report`)
+  const itemNumbers = [...uniqueNames]
+  console.log(`\n[Cost Batch] Submitting ${itemNumbers.length} unique items (covering ${batch.length} records) to Inventory Values report`)
+
   let reportId
   try {
     reportId = await submitInventoryValuesReport(itemNumbers)
@@ -475,6 +628,7 @@ async function fireCostBatch(loggerInst) {
 
   // Build map: itemNumber → best avg cost
   // Each item_number may appear in multiple warehouses; take the max non-zero avg
+  // across warehouses (per-item aggregation).
   const costMap = {}
   for (const row of rows) {
     const item = row.product_item_number
@@ -485,17 +639,32 @@ async function fireCostBatch(loggerInst) {
   }
 
   // Apply to each pending record
+  // For each record: check primary + all siblings in costMap, use MIN non-zero.
+  // Min (not max) is the conservative choice when siblings disagree — avoids
+  // inflating markup. A matching sibling is treated the same as a primary hit.
   let found = 0
   let notFound = 0
-  for (const { recordId, itemNumber } of batch) {
-    const cost = costMap[itemNumber]
+  for (const { recordId, itemNumber, siblings } of batch) {
+    const candidates = [itemNumber, ...(siblings || [])].filter(Boolean)
+    let minCost = Infinity
+    let source = null
+    for (const name of candidates) {
+      const c = costMap[name]
+      if (c && c > MIN_COST_THRESHOLD && c < minCost) {
+        minCost = c
+        source = name
+      }
+    }
+    const cost = minCost === Infinity ? null : minCost
+
     if (cost && cost > MIN_COST_THRESHOLD) {
       await writeFields(recordId, {
         [FIELDS.ITEM_COST]: cost,
         [FIELDS.AI_COST_CHECK]: AI_COST_CHECK.FOUND,
         [FIELDS.COST_FIX]: COST_FIX.INPUTTED,
       })
-      console.log(`  ✓ Cost found for ${itemNumber}: $${cost.toFixed(2)}`)
+      const sourceTag = source === itemNumber ? 'primary' : `sibling:${source}`
+      console.log(`  ✓ Cost found for ${itemNumber}: $${cost.toFixed(2)} [${sourceTag}]`)
       found++
       if (loggerInst) {
         loggerInst.log({
@@ -503,7 +672,7 @@ async function fireCostBatch(loggerInst) {
           outcome: PATH.COST_RECOVERY_PENDING,
           enrichmentPath: PATH.COST_RECOVERY_PENDING,
           costFound: cost,
-          costSource: 'Inventory Values Report',
+          costSource: source === itemNumber ? 'Inventory Values Report' : `Inventory Values Report (sibling: ${source})`,
         })
       }
     } else {
@@ -1357,11 +1526,44 @@ async function processRecord(record, loggerInst) {
     }
   }
   if (cost <= MIN_COST_THRESHOLD) {
-    // Queue for cost-recovery batch
-    console.log(`  → Cost missing — queued for Inventory Values report batch`)
-    addToCostPending(record.id, itemNumber)
-    writeLog(loggerInst, logCtx, PATH.COST_RECOVERY_PENDING)
-    return 'cost_pending'
+    // Generate sibling candidates once — used for both inline Airtable lookup
+    // and the GoFlow batch (via addToCostPending's siblings param).
+    const candidates = generateSiblingCandidates(itemNumber, f[FIELDS.UPC_CODE])
+
+    // ── Stage 1: Airtable sibling cost lookup (inline, cheap) ──────────────
+    // Query records sharing the same base item number OR same UPC that already
+    // have a valid cost. Uses the GLOBAL_ITEM_NUMBER + VARIANT_BARCODE formula
+    // fields. If a match exists, write its cost and skip the GoFlow batch
+    // entirely.
+    const atSibling = await findSiblingCostInAirtable(candidates)
+    if (atSibling) {
+      console.log(`  ✓ Cost from Airtable sibling (${atSibling.source}): $${atSibling.cost.toFixed(2)}`)
+      await writeFields(record.id, {
+        [FIELDS.ITEM_COST]: atSibling.cost,
+        [FIELDS.AI_COST_CHECK]: AI_COST_CHECK.FOUND,
+        [FIELDS.COST_FIX]: COST_FIX.INPUTTED,
+      })
+      if (loggerInst) {
+        loggerInst.log({
+          itemNumber,
+          outcome: PATH.COST_RECOVERY_PENDING,
+          enrichmentPath: PATH.COST_RECOVERY_PENDING,
+          costFound: atSibling.cost,
+          costSource: `Airtable sibling (${atSibling.source})`,
+        })
+      }
+      // Continue processing the record in the same pass — cost is now resolved.
+      // Fall through to Phase 2 below.
+    } else {
+      // ── Stage 2: queue for GoFlow batch WITH sibling candidates ──────────
+      // fireCostBatch will submit primary + siblings in one report, and on
+      // apply take MIN non-zero cost across primary + all siblings.
+      const siblings = (candidates.enumeratedSiblings || []).filter(s => s !== itemNumber)
+      console.log(`  → Cost missing — queued for Inventory Values report batch (${siblings.length} sibling candidates)`)
+      addToCostPending(record.id, itemNumber, siblings)
+      writeLog(loggerInst, logCtx, PATH.COST_RECOVERY_PENDING)
+      return 'cost_pending'
+    }
   }
 
   // ── PHASE 2: UPC RESOLUTION ───────────────────────────────────────────────
@@ -1407,6 +1609,37 @@ async function processRecord(record, loggerInst) {
       }
       // Otherwise retry next pass
       return 'retry'
+    }
+  }
+
+  // ── PHASE 4.5: SIBLING ENRICHMENT BY BASE (wider-key fallback) ────────────
+  // Runs only if Phase 4 UPC match returned null. Queries for a shipped
+  // record sharing the same base item number (cross-condition sibling). Safe
+  // to copy because same base = same physical SKU, just a different condition
+  // — colorway/size fields transfer correctly. Reuses buildUPCMatchPayload.
+  if (!upcMatch) {
+    const baseForEnrich = parsed?.baseItemNumber
+    if (baseForEnrich) {
+      const siblingMatch = await findSiblingEnrichmentByBase(baseForEnrich)
+      if (siblingMatch) {
+        console.log(`  ✓ Sibling enrichment match found: ${siblingMatch.fields[FIELDS.ITEM_NUMBER]}`)
+        const payload = buildUPCMatchPayload(siblingMatch, record, parsed)
+        await writeFields(record.id, payload)
+        logCtx.sourcesUsed.push('Sibling Match (base)')
+        logCtx.fieldsWritten = Object.keys(payload).map(k => resolveFieldName(k))
+        const valid = await checkValidation(record.id)
+        if (valid.both) {
+          await markDone(record.id, logCtx)
+          writeLog(loggerInst, logCtx, PATH.UPC_MATCH)
+          return 'done'
+        }
+        if (attempts >= MAX_ATTEMPTS) {
+          await parkForVA(record.id, [valid.productWhy, valid.variantWhy].filter(Boolean).join(' | ') || 'Validation failed after sibling match', logCtx)
+          writeLog(loggerInst, logCtx, PATH.PARKED)
+          return 'parked'
+        }
+        return 'retry'
+      }
     }
   }
 
