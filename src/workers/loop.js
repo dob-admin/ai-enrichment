@@ -1443,6 +1443,14 @@ function buildClaudeWritePayload(claudeOutput, recordContext) {
     else missingFields.push('Option 3 Custom Value (used condition)')
   }
 
+  // LTV non-footwear: write Opt 3 Custom = Claude's optional Detail value.
+  // Claude is asked to return a meaningful variant axis when one exists (scent,
+  // handle type, pack size, flavor, etc.); null when not. Footwear LTV records
+  // leave Opt 3 empty regardless — width is in Opt 2 via the Airtable formula.
+  if (website === WEBSITE.LTV && !isFootwear && claudeOutput.option3CustomValue) {
+    fields[FIELDS.OPTION_3_CUSTOM] = claudeOutput.option3CustomValue
+  }
+
   if (claudeOutput.imageUrls?.length) {
     fields[FIELDS.PRODUCT_IMAGES] = claudeOutput.imageUrls.map(url => ({ url }))
     fields[FIELDS.VARIANT_IMAGE_INDEX] = 1

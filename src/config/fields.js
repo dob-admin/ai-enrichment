@@ -138,6 +138,7 @@ export const FOOTWEAR_STORES = [WEBSITE.SDO, WEBSITE.REBOUND]
 export const NPCN_STORES = [WEBSITE.LTV, WEBSITE.RTV]
 
 // Condition codes and their full text labels (for NPCN RTV title suffix)
+// UAP and UAC both resolve to "Used Acceptable" — UAP is a synonym variant.
 export const CONDITION_LABELS = {
   NMB: 'New - Missing Box',
   ULN: 'Used Like New',
@@ -145,6 +146,7 @@ export const CONDITION_LABELS = {
   UGD: 'Used Good',
   UAI: 'Used As-Is',
   UAC: 'Used Acceptable',
+  UAP: 'Used Acceptable',
   UDF: 'Used - Defective',
 }
 

@@ -1,7 +1,7 @@
 // src/lib/parser.js
 // Parses DOB item numbers into structured components
 
-const CONDITION_CODES = ['NMB', 'ULN', 'UVG', 'UGD', 'UAI', 'UAC', 'UDF']
+const CONDITION_CODES = ['NMB', 'ULN', 'UVG', 'UGD', 'UAI', 'UAC', 'UAP', 'UDF']
 const CONDITION_REGEX = new RegExp(`_(${CONDITION_CODES.join('|')})$`, 'i')
 const UPC_REGEX = /^\d{8,14}$/
 
@@ -161,11 +161,14 @@ export function parseItemNumber(itemNumber) {
   }
 
   // Extract condition code from anywhere in item number if not at end
-  // Used to populate Manual Condition Type when formula can't extract
+  // Used to populate Manual Condition Type when formula can't extract.
+  // Case-insensitive: normalize to uppercase before checking against CONDITION_CODES
+  // (which are always uppercase) so e.g. "_uap_" or "_Uap" still matches.
   let embeddedCondition = conditionCode
   if (!embeddedCondition) {
+    const rawUpper = raw.toUpperCase()
     for (const code of CONDITION_CODES) {
-      if (raw.includes(`_${code}_`) || raw.includes(`_${code}`)) {
+      if (rawUpper.includes(`_${code}_`) || rawUpper.includes(`_${code}`)) {
         embeddedCondition = code
         break
       }
@@ -320,9 +323,8 @@ export function generateSiblingCandidates(itemNumber, upcCode) {
   // representing the "unconditioned" SKU — see the Saucony UI screenshot where
   // `Saucony_S10810_05_Size_10_5M` exists alongside the suffixed variants.
   if (result.base) {
-    const codes = ['NMB', 'ULN', 'UVG', 'UGD', 'UAI', 'UAC', 'UDF']
     const siblings = [result.base]
-    for (const code of codes) {
+    for (const code of CONDITION_CODES) {
       siblings.push(`${result.base}_${code}`)
     }
     // Deduplicate — the record's own item number (suffixed form) is a valid

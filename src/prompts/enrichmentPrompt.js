@@ -186,7 +186,7 @@ ${sourceText || 'No sources found — return Not Found status'}
   "material": ["array", "of", "materials"] or null,
   "option1Value": "string — colorway" or null,
   "option2CustomValue": "string" or null,
-  "option3CustomValue": "string — condition text for NPCN RTV" or null,
+  "option3CustomValue": "string — condition text for NPCN RTV; or detail (scent, handle type, pack size, etc.) for NPCN LTV non-footwear" or null,
   "price": number or null,
   "imageUrls": ["array", "of", "url", "strings"],
   "confidence": "high" | "medium" | "low",
