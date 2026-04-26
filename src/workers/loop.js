@@ -135,6 +135,17 @@ function truthy(v) {
   return !!v
 }
 
+// Shopify rejects " / " (space-slash-space) in product option names and values
+// because it's reserved for Combined Listings. Normalize any "/" — with or
+// without surrounding whitespace — to " - " before writing option values.
+// Defense-in-depth: even though the prompt instructs Claude to use " - ",
+// upstream sources (GoFlow, Keepa) sometimes contain slashes, and Claude has
+// been observed to faithfully echo them when the colorway lists colors that way.
+function sanitizeOptionValue(value) {
+  if (typeof value !== 'string' || !value.includes('/')) return value
+  return value.replace(/\s*\/\s*/g, ' - ').replace(/ {2,}/g, ' ').trim()
+}
+
 // Extract UPC substring from item number (12-14 consecutive digits, not embedded in other digits)
 function extractUPCFromString(str) {
   if (!str) return null
@@ -1237,8 +1248,9 @@ function buildUPCMatchPayload(matchRecord, currentRecord, parsed) {
   // Option 1 Value (colorway / color). Mirror to SDO_Color when match has it
   // populated — that itself signals the match record was a footwear item.
   if (truthy(m[FIELDS.OPTION_1_VALUE])) {
-    fields[FIELDS.OPTION_1_VALUE] = m[FIELDS.OPTION_1_VALUE]
-    if (truthy(m[FIELDS.SDO_COLOR])) fields[FIELDS.SDO_COLOR] = m[FIELDS.OPTION_1_VALUE]
+    const o1 = sanitizeOptionValue(m[FIELDS.OPTION_1_VALUE])
+    fields[FIELDS.OPTION_1_VALUE] = o1
+    if (truthy(m[FIELDS.SDO_COLOR])) fields[FIELDS.SDO_COLOR] = o1
   }
 
   // The match record is "footwear-shaped" if it has any SDO_* size data —
@@ -1253,7 +1265,7 @@ function buildUPCMatchPayload(matchRecord, currentRecord, parsed) {
   // Option 2 Custom (NPCN only — size). Skip when match had shoe data, so the
   // current record's Option 2 Value formula can derive size+width from SDO_*.
   if (NPCN_STORES.includes(website) && truthy(m[FIELDS.OPTION_2_CUSTOM]) && !matchHasShoeData) {
-    fields[FIELDS.OPTION_2_CUSTOM] = m[FIELDS.OPTION_2_CUSTOM]
+    fields[FIELDS.OPTION_2_CUSTOM] = sanitizeOptionValue(m[FIELDS.OPTION_2_CUSTOM])
   }
 
   // SDO_* size/width fields. No website gate — if the match record has these
@@ -1417,8 +1429,9 @@ function buildClaudeWritePayload(claudeOutput, recordContext) {
   }
 
   if (claudeOutput.option1Value) {
-    fields[FIELDS.OPTION_1_VALUE] = claudeOutput.option1Value
-    if (isFootwear) fields[FIELDS.SDO_COLOR] = claudeOutput.option1Value
+    const o1 = sanitizeOptionValue(claudeOutput.option1Value)
+    fields[FIELDS.OPTION_1_VALUE] = o1
+    if (isFootwear) fields[FIELDS.SDO_COLOR] = o1
   } else if (isFootwear) {
     missingFields.push('Option 1 Value (colorway)')
   }
@@ -1429,7 +1442,7 @@ function buildClaudeWritePayload(claudeOutput, recordContext) {
   // short-circuit the formula (it returns Custom Value when present) and width
   // would never render in the variant.
   if (isNPCN && !isFootwear && claudeOutput.option2CustomValue) {
-    fields[FIELDS.OPTION_2_CUSTOM] = claudeOutput.option2CustomValue
+    fields[FIELDS.OPTION_2_CUSTOM] = sanitizeOptionValue(claudeOutput.option2CustomValue)
   }
 
   if (isRTV) {
@@ -1439,16 +1452,8 @@ function buildClaudeWritePayload(claudeOutput, recordContext) {
     const conditionText = (parsedItem.conditionCode && CONDITION_LABELS[parsedItem.conditionCode])
       || claudeOutput.option3CustomValue
       || null
-    if (conditionText) fields[FIELDS.OPTION_3_CUSTOM] = conditionText
+    if (conditionText) fields[FIELDS.OPTION_3_CUSTOM] = sanitizeOptionValue(conditionText)
     else missingFields.push('Option 3 Custom Value (used condition)')
-  }
-
-  // LTV non-footwear: write Opt 3 Custom = Claude's optional Detail value.
-  // Claude is asked to return a meaningful variant axis when one exists (scent,
-  // handle type, pack size, flavor, etc.); null when not. Footwear LTV records
-  // leave Opt 3 empty regardless — width is in Opt 2 via the Airtable formula.
-  if (website === WEBSITE.LTV && !isFootwear && claudeOutput.option3CustomValue) {
-    fields[FIELDS.OPTION_3_CUSTOM] = claudeOutput.option3CustomValue
   }
 
   if (claudeOutput.imageUrls?.length) {

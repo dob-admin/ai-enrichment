@@ -109,11 +109,11 @@ If a material from the source is NOT on the approved list:
 
 ## VARIANT OPTIONS — PER STORE RULES
 ${website === WEBSITE.SDO ? `Store: SDO (new footwear)
-- Option 1 (colorway): REQUIRED — use the colorway exactly as listed, capitalize first letter of each color, multiple colors use " / " (e.g. "Black / White")
+- Option 1 (colorway): REQUIRED — use the colorway exactly as listed, capitalize first letter of each color, multiple colors use " - " (e.g. "Black - White"). NEVER use " / " — Shopify reserves that character for Combined Listings and will reject the variant.
 - Option 2 (size): set automatically by formula — NEVER write
 - Option 3 (width): optional — only write if explicitly stated in source, leave null if unknown` : ''}
 ${website === WEBSITE.REBOUND ? `Store: Rebound (used footwear)
-- Option 1 (colorway): REQUIRED — use the colorway exactly as listed, capitalize first letter of each color, multiple colors use " / " (e.g. "Black / White")
+- Option 1 (colorway): REQUIRED — use the colorway exactly as listed, capitalize first letter of each color, multiple colors use " - " (e.g. "Black - White"). NEVER use " / " — Shopify reserves that character for Combined Listings and will reject the variant.
 - Option 2 (size): set automatically by formula — NEVER write
 - Option 3 (width): optional — only write if explicitly stated in source, leave null if unknown` : ''}
 ${website === WEBSITE.LTV ? `Store: NPCN LTV (new general merchandise)
@@ -186,7 +186,7 @@ ${sourceText || 'No sources found — return Not Found status'}
   "material": ["array", "of", "materials"] or null,
   "option1Value": "string — colorway" or null,
   "option2CustomValue": "string" or null,
-  "option3CustomValue": "string — condition text for NPCN RTV; or detail (scent, handle type, pack size, etc.) for NPCN LTV non-footwear" or null,
+  "option3CustomValue": "string — condition text for NPCN RTV" or null,
   "price": number or null,
   "imageUrls": ["array", "of", "url", "strings"],
   "confidence": "high" | "medium" | "low",
