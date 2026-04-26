@@ -753,12 +753,14 @@ function normalizeKeepa(product) {
   const imageUrls = (product.imagesCSV || '').split(',').filter(Boolean)
     .map(id => `https://images-na.ssl-images-amazon.com/images/I/${id}`)
   const features = product.features || []
+  const categoryPath = (product.categoryTree || []).map(c => c?.name).filter(Boolean)
   return {
     name: product.title || null,
     brand: product.brand || null,
     description: [product.description, features.join(' ')].filter(Boolean).join('\n\n') || null,
     features,
-    category: product.categoryTree?.[product.categoryTree.length - 1]?.name || null,
+    category: categoryPath[categoryPath.length - 1] || null,
+    categoryPath,  // full hierarchy: ["Clothing, Shoes & Jewelry", "Men", "Shoes", "Athletic", "Running"]
     imageUrls,
     upc: product.upcList?.[0] || null,
     asin: product.asin || null,
@@ -777,7 +779,40 @@ function normalizeKeepa(product) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// ATTRIBUTE EXTRACTION CASCADE (SDO/REBOUND ONLY)
+// FOOTWEAR DETECTION (across all websites)
+// ══════════════════════════════════════════════════════════════════════════════
+// SDO/REBOUND are by definition footwear stores. LTV/RTV are NPCN, which now
+// holds both former-SDO/REBOUND footwear (post-migration) AND non-footwear
+// items. We use Keepa's category path as the source of truth for LTV/RTV: if
+// the path contains any footwear keyword, run shoe enrichment; otherwise leave
+// the record on the existing LTV/RTV (non-shoe) codepath.
+
+const FOOTWEAR_KEYWORDS = [
+  'shoe', 'sneaker', 'boot', 'sandal', 'footwear',
+  'loafer', 'slipper', 'flip-flop', 'flip flop',
+  'mule', 'clog', 'oxford', 'moccasin', 'espadrille',
+]
+
+function isFootwearByKeepaCategory(keepaSource) {
+  if (!keepaSource?.categoryPath?.length) return false
+  const joined = keepaSource.categoryPath.join(' / ').toLowerCase()
+  return FOOTWEAR_KEYWORDS.some(kw => joined.includes(kw))
+}
+
+function isFootwearItem(record, sources) {
+  const website = record.fields[FIELDS.WEBSITE]
+  // SDO/REBOUND are always footwear (legacy stores).
+  if (FOOTWEAR_STORES.includes(website)) return true
+  // LTV/RTV: defer to Keepa. No Keepa or non-footwear category → not footwear.
+  if (NPCN_STORES.includes(website)) {
+    const keepaSource = sources?.find(s => s.type?.startsWith('Keepa'))
+    return isFootwearByKeepaCategory(keepaSource)
+  }
+  return false
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ATTRIBUTE EXTRACTION CASCADE (FOOTWEAR ONLY)
 // ══════════════════════════════════════════════════════════════════════════════
 // Derives gender, age range, and size fields from available sources.
 //
@@ -1002,8 +1037,7 @@ function parseSizeString(sizeStr) {
 // Main extraction cascade — for SDO/REBOUND only
 // Returns { gender, ageRange, sizeFields: {fieldId: value, ...} } or { skip: true } if not footwear
 function extractAttributes(record, sources, parsed, upcMatch) {
-  const website = record.fields[FIELDS.WEBSITE]
-  if (!FOOTWEAR_STORES.includes(website)) return { skip: true }
+  if (!isFootwearItem(record, sources)) return { skip: true }
 
   const f = record.fields
 
@@ -1182,7 +1216,6 @@ function normalizeAgeRange(raw) {
 function buildUPCMatchPayload(matchRecord, currentRecord, parsed) {
   const m = matchRecord.fields
   const website = currentRecord.fields[FIELDS.WEBSITE]
-  const isFootwear = FOOTWEAR_STORES.includes(website)
   const isRTV = website === WEBSITE.RTV
 
   const fields = {}
@@ -1201,28 +1234,40 @@ function buildUPCMatchPayload(matchRecord, currentRecord, parsed) {
     fields[FIELDS.VARIANT_IMAGE_INDEX] = 1
   }
 
-  // Option 1 Value (colorway / color)
+  // Option 1 Value (colorway / color). Mirror to SDO_Color when match has it
+  // populated — that itself signals the match record was a footwear item.
   if (truthy(m[FIELDS.OPTION_1_VALUE])) {
     fields[FIELDS.OPTION_1_VALUE] = m[FIELDS.OPTION_1_VALUE]
-    if (isFootwear) fields[FIELDS.SDO_COLOR] = m[FIELDS.OPTION_1_VALUE]
+    if (truthy(m[FIELDS.SDO_COLOR])) fields[FIELDS.SDO_COLOR] = m[FIELDS.OPTION_1_VALUE]
   }
 
-  // Option 2 Custom (NPCN only — size)
-  if (NPCN_STORES.includes(website) && truthy(m[FIELDS.OPTION_2_CUSTOM])) {
+  // The match record is "footwear-shaped" if it has any SDO_* size data —
+  // a strong signal that we should let the Option 2 Value formula derive
+  // size+width from the SDO_* fields we copy below, not short-circuit it
+  // by copying OPTION_2_CUSTOM forward.
+  const matchHasShoeData =
+    truthy(m[FIELDS.SDO_MEN_SIZE]) ||
+    truthy(m[FIELDS.SDO_WOMEN_SIZE]) ||
+    truthy(m[FIELDS.SDO_YOUTH_SIZE])
+
+  // Option 2 Custom (NPCN only — size). Skip when match had shoe data, so the
+  // current record's Option 2 Value formula can derive size+width from SDO_*.
+  if (NPCN_STORES.includes(website) && truthy(m[FIELDS.OPTION_2_CUSTOM]) && !matchHasShoeData) {
     fields[FIELDS.OPTION_2_CUSTOM] = m[FIELDS.OPTION_2_CUSTOM]
   }
 
-  // SDO_* size fields (footwear only)
-  if (isFootwear) {
-    if (truthy(m[FIELDS.SDO_GENDER])) fields[FIELDS.SDO_GENDER] = normalizeGender(m[FIELDS.SDO_GENDER]) || m[FIELDS.SDO_GENDER]
-    if (truthy(m[FIELDS.SDO_AGE_RANGE])) fields[FIELDS.SDO_AGE_RANGE] = normalizeAgeRange(m[FIELDS.SDO_AGE_RANGE])
-    if (truthy(m[FIELDS.SDO_MEN_SIZE])) fields[FIELDS.SDO_MEN_SIZE] = m[FIELDS.SDO_MEN_SIZE]
-    if (truthy(m[FIELDS.SDO_MEN_WIDTH])) fields[FIELDS.SDO_MEN_WIDTH] = m[FIELDS.SDO_MEN_WIDTH]
-    if (truthy(m[FIELDS.SDO_WOMEN_SIZE])) fields[FIELDS.SDO_WOMEN_SIZE] = m[FIELDS.SDO_WOMEN_SIZE]
-    if (truthy(m[FIELDS.SDO_WOMEN_WIDTH])) fields[FIELDS.SDO_WOMEN_WIDTH] = m[FIELDS.SDO_WOMEN_WIDTH]
-    if (truthy(m[FIELDS.SDO_YOUTH_SIZE])) fields[FIELDS.SDO_YOUTH_SIZE] = m[FIELDS.SDO_YOUTH_SIZE]
-    if (truthy(m[FIELDS.SDO_YOUTH_WIDTH])) fields[FIELDS.SDO_YOUTH_WIDTH] = m[FIELDS.SDO_YOUTH_WIDTH]
-  }
+  // SDO_* size/width fields. No website gate — if the match record has these
+  // populated, it was a footwear item, and the same shoe data applies to the
+  // current record (UPC match implies same product). truthy() per-field
+  // prevents copying nulls onto non-shoe records that matched a recycled UPC.
+  if (truthy(m[FIELDS.SDO_GENDER])) fields[FIELDS.SDO_GENDER] = normalizeGender(m[FIELDS.SDO_GENDER]) || m[FIELDS.SDO_GENDER]
+  if (truthy(m[FIELDS.SDO_AGE_RANGE])) fields[FIELDS.SDO_AGE_RANGE] = normalizeAgeRange(m[FIELDS.SDO_AGE_RANGE])
+  if (truthy(m[FIELDS.SDO_MEN_SIZE])) fields[FIELDS.SDO_MEN_SIZE] = m[FIELDS.SDO_MEN_SIZE]
+  if (truthy(m[FIELDS.SDO_MEN_WIDTH])) fields[FIELDS.SDO_MEN_WIDTH] = m[FIELDS.SDO_MEN_WIDTH]
+  if (truthy(m[FIELDS.SDO_WOMEN_SIZE])) fields[FIELDS.SDO_WOMEN_SIZE] = m[FIELDS.SDO_WOMEN_SIZE]
+  if (truthy(m[FIELDS.SDO_WOMEN_WIDTH])) fields[FIELDS.SDO_WOMEN_WIDTH] = m[FIELDS.SDO_WOMEN_WIDTH]
+  if (truthy(m[FIELDS.SDO_YOUTH_SIZE])) fields[FIELDS.SDO_YOUTH_SIZE] = m[FIELDS.SDO_YOUTH_SIZE]
+  if (truthy(m[FIELDS.SDO_YOUTH_WIDTH])) fields[FIELDS.SDO_YOUTH_WIDTH] = m[FIELDS.SDO_YOUTH_WIDTH]
 
   // Option 3 Custom — RTV only, derive from CURRENT record's condition (never copy from match)
   if (isRTV) {
@@ -1332,7 +1377,10 @@ async function callClaude(recordContext, sources) {
 function buildClaudeWritePayload(claudeOutput, recordContext) {
   const { airtableData, parsedItem } = recordContext
   const website = airtableData.website
-  const isFootwear = FOOTWEAR_STORES.includes(website)
+  // isFootwear is computed once after Keepa is fetched and stashed on
+  // recordContext (see Phase 5 of processOne). Falls back to website-only
+  // detection for safety if the flag wasn't set.
+  const isFootwear = recordContext.isFootwear ?? FOOTWEAR_STORES.includes(website)
   const isNPCN = NPCN_STORES.includes(website)
   const isRTV = website === WEBSITE.RTV
 
@@ -1375,7 +1423,12 @@ function buildClaudeWritePayload(claudeOutput, recordContext) {
     missingFields.push('Option 1 Value (colorway)')
   }
 
-  if (isNPCN && claudeOutput.option2CustomValue) {
+  // For non-footwear NPCN records, write Claude's size to Option 2 Custom.
+  // For footwear, leave Option 2 Custom blank — the Airtable formula derives
+  // size+width from SDO_*_Size + SDO_*_Width fields. Writing Custom here would
+  // short-circuit the formula (it returns Custom Value when present) and width
+  // would never render in the variant.
+  if (isNPCN && !isFootwear && claudeOutput.option2CustomValue) {
     fields[FIELDS.OPTION_2_CUSTOM] = claudeOutput.option2CustomValue
   }
 
@@ -1718,8 +1771,13 @@ async function processRecord(record, loggerInst) {
 
   logCtx.sourcesUsed = sources.map(s => s.type)
 
-  // ── PHASE 6: GENDER/SIZE EXTRACTION (SDO/REBOUND only) ────────────────────
-  if (FOOTWEAR_STORES.includes(website)) {
+  // Compute footwear flag once, after all sources are populated. Used by
+  // Phase 6 below and by buildClaudeWritePayload via recordContext.
+  const isFootwear = isFootwearItem(record, sources)
+  recordContext.isFootwear = isFootwear
+
+  // ── PHASE 6: GENDER/SIZE EXTRACTION (footwear only) ──────────────────────
+  if (isFootwear) {
     const attrs = extractAttributes(record, sources, parsed, null)
     if (attrs.noSize) {
       if (attempts >= MAX_ATTEMPTS) {
